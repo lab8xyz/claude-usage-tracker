@@ -464,24 +464,26 @@ class UsagePopup(Gtk.Window):
                     False, False, 0
                 )
 
-            # Extra usage / overage credits
+            # Extra usage / overage spend
             extra = usage_data.extra_usage
             if extra:
                 sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
                 sep.set_margin_top(4)
                 content_box.pack_start(sep, False, False, 0)
-                extra_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-                extra_label = Gtk.Label(label="Overage Credits")
-                extra_label.get_style_context().add_class("usage-label")
-                extra_label.set_halign(Gtk.Align.START)
-                used = extra.get("used_credits", 0) or 0
-                limit = extra.get("monthly_limit", 0) or 0
-                extra_val = Gtk.Label(label=f"${used:.2f} / ${limit:.2f}")
-                extra_val.get_style_context().add_class("usage-pct")
-                extra_val.get_style_context().add_class("pct-green")
-                extra_box.pack_start(extra_label, True, True, 0)
-                extra_box.pack_end(extra_val, False, False, 0)
-                content_box.pack_start(extra_box, False, False, 0)
+
+                used_cents = extra.get("used_credits", 0) or 0
+                limit_cents = extra.get("monthly_limit", 0) or 0
+                used = used_cents / 100.0
+                limit = limit_cents / 100.0
+                pct = (used / limit * 100) if limit > 0 else 0
+
+                content_box.pack_start(
+                    self._make_usage_row(
+                        f"Extra Usage ({used:.2f} / {limit:.2f})",
+                        pct, None
+                    ),
+                    False, False, 0
+                )
 
             main_box.pack_start(content_box, False, False, 0)
 
