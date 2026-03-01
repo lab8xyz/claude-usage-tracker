@@ -41,8 +41,11 @@ APP_NAME = "Claude Usage Tracker"
 # Notification thresholds: every 5% from 75 onwards, each fires once per reset cycle
 NOTIFY_THRESHOLDS = list(range(75, 101, 5))  # [75, 80, 85, 90, 95, 100]
 
-# Daily pacing: alert if weekly usage exceeds expected pace by this many percentage points
-PACE_ALERT_MARGIN = 15
+# Pacing alerts: first at +10% ahead, then every 5% (+15, +20, +25...)
+PACE_FIRST_THRESHOLD = 10
+PACE_STEP = 5
+# Grace period: ignore pacing alerts within this many minutes of a new window
+PACE_GRACE_MINUTES = 10
 
 # Colors
 COLOR_GREEN = (0.30, 0.69, 0.31)   # #4CAF50
@@ -694,7 +697,7 @@ class UsagePopup(Gtk.Window):
         time_label.get_style_context().add_class("reset-text")
         time_label.set_halign(Gtk.Align.START)
 
-        if pace_diff > PACE_ALERT_MARGIN:
+        if pace_diff > PACE_FIRST_THRESHOLD:
             pace_text = f"  {pace_diff:+.0f}% ahead"
             pace_class = "pct-red"
         elif pace_diff > 5:
@@ -877,7 +880,8 @@ class ClaudeUsageTracker:
         self.status_desc = "Checking..."
         self._notified_session = set()
         self._notified_weekly = set()
-        self._notified_pacing = False
+        self._notified_session_pace = set()
+        self._notified_weekly_pace = set()
         self._last_session_reset = None
         self._last_weekly_reset = None
 
@@ -1021,10 +1025,11 @@ class ClaudeUsageTracker:
 
         if norm_session != self._last_session_reset:
             self._notified_session.clear()
+            self._notified_session_pace.clear()
             self._last_session_reset = norm_session
         if norm_weekly != self._last_weekly_reset:
             self._notified_weekly.clear()
-            self._notified_pacing = False
+            self._notified_weekly_pace.clear()
             self._last_weekly_reset = norm_weekly
 
         # Threshold notifications: every 5% from 75 onwards, each fires once
@@ -1046,21 +1051,47 @@ class ClaudeUsageTracker:
                     "dialog-warning" if threshold >= 90 else "dialog-information"
                 )
 
-        # Pacing alerts: notify once when significantly ahead of pace
-        if not self._notified_pacing:
-            pacing = calc_pacing(usage.weekly_pct, usage.weekly_reset, 168)
-            if pacing:
-                elapsed, total, unit, expected_pct, pace_diff = pacing
-                if pace_diff > PACE_ALERT_MARGIN:
-                    self._notified_pacing = True
-                    unit_label = "Hour" if unit == "h" else "Day"
-                    self._send_notification(
-                        f"Weekly usage ahead of pace",
-                        f"{unit_label} {elapsed:.1f}/{total:.0f}: using {usage.weekly_pct:.0f}% "
-                        f"(expected ~{expected_pct:.0f}%). "
-                        f"{pace_diff:.0f}% ahead - you may run out before reset.",
-                        "dialog-warning"
-                    )
+        # Pacing alerts for session and weekly
+        self._check_pace_notifications(
+            "Session", usage.session_pct, usage.session_reset,
+            5, self._notified_session_pace
+        )
+        self._check_pace_notifications(
+            "Weekly", usage.weekly_pct, usage.weekly_reset,
+            168, self._notified_weekly_pace
+        )
+
+    def _check_pace_notifications(self, label, pct, reset_iso, window_hours, notified_set):
+        """Check and send pacing notifications for a usage window."""
+        pacing = calc_pacing(pct, reset_iso, window_hours)
+        if not pacing:
+            return
+
+        elapsed, total, unit, expected_pct, pace_diff = pacing
+
+        # Grace period: skip alerts in the first 10 minutes of a new window
+        elapsed_minutes = elapsed * 60 if unit == "h" else elapsed * 24 * 60
+        if elapsed_minutes < PACE_GRACE_MINUTES:
+            return
+
+        if pace_diff < PACE_FIRST_THRESHOLD:
+            return
+
+        # Build thresholds: first at PACE_FIRST_THRESHOLD, then every PACE_STEP
+        # e.g. 10, 15, 20, 25, ...
+        threshold = PACE_FIRST_THRESHOLD
+        while threshold <= pace_diff:
+            if threshold not in notified_set:
+                notified_set.add(threshold)
+                unit_label = "Hour" if unit == "h" else "Day"
+                self._send_notification(
+                    f"{label} usage {pace_diff:.0f}% ahead of pace",
+                    f"{unit_label} {elapsed:.1f}/{total:.0f}: using {pct:.0f}% "
+                    f"(expected ~{expected_pct:.0f}%). "
+                    f"You may run out before reset.",
+                    "dialog-warning"
+                )
+            threshold += PACE_STEP
 
     def _send_notification(self, title, body, icon_name):
         """Send a desktop notification."""
