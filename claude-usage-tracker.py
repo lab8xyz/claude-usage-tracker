@@ -30,6 +30,7 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Notify, XApp
 
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
+PROFILE_API_URL = "https://api.anthropic.com/api/oauth/profile"
 POLL_INTERVAL_SECONDS = 60
 ICON_SIZE = 24
 APP_ID = "claude-usage-tracker"
@@ -231,26 +232,35 @@ class ClaudeAPIClient:
         # expiresAt is in milliseconds
         return time.time() * 1000 >= self.expires_at
 
-    def fetch_usage(self):
-        """Fetch usage data from the API. Returns dict or None on error."""
-        if not self.access_token:
-            self.reload_credentials()
-            if not self.access_token:
-                return None
-
-        if self.is_token_expired():
-            self.reload_credentials()
-            if self.is_token_expired():
-                return {"error": "Token expired. Re-login with: claude login"}
-
-        headers = {
+    def _build_headers(self):
+        """Build authenticated request headers."""
+        return {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
             "User-Agent": "claude-code/2.1.5",
             "anthropic-beta": "oauth-2025-04-20",
         }
+
+    def _ensure_token(self):
+        """Ensure we have a valid token. Returns error dict or None."""
+        if not self.access_token:
+            self.reload_credentials()
+            if not self.access_token:
+                return {"error": "No credentials. Run: claude login"}
+        if self.is_token_expired():
+            self.reload_credentials()
+            if self.is_token_expired():
+                return {"error": "Token expired. Re-login with: claude login"}
+        return None
+
+    def fetch_usage(self):
+        """Fetch usage data from the API. Returns dict or None on error."""
+        err = self._ensure_token()
+        if err:
+            return err
+
         try:
-            resp = requests.get(USAGE_API_URL, headers=headers, timeout=15)
+            resp = requests.get(USAGE_API_URL, headers=self._build_headers(), timeout=15)
             if resp.status_code == 401:
                 self.reload_credentials()
                 return {"error": "Authentication failed (401). Try: claude login"}
@@ -266,6 +276,29 @@ class ClaudeAPIClient:
             return {"error": f"API error: {e}"}
         except json.JSONDecodeError:
             return {"error": "Invalid JSON response from API"}
+
+    def refresh_plan_info(self):
+        """Fetch current plan info from the profile API.
+
+        Updates rate_limit_tier and subscription_type from the server
+        so plan changes are detected without re-login.
+        """
+        err = self._ensure_token()
+        if err:
+            return
+        try:
+            resp = requests.get(PROFILE_API_URL, headers=self._build_headers(), timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                org = data.get("organization", {})
+                tier = org.get("rate_limit_tier")
+                org_type = org.get("organization_type")
+                if tier:
+                    self.rate_limit_tier = tier
+                if org_type:
+                    self.subscription_type = org_type
+        except Exception:
+            pass  # Non-critical, keep using cached values
 
 
 # --- Usage Data Model ---
@@ -775,6 +808,7 @@ class ClaudeUsageTracker:
 
     def _fetch_and_update(self):
         """Fetch usage data and update UI (runs in background thread)."""
+        self.client.refresh_plan_info()
         raw = self.client.fetch_usage()
         usage = UsageData(raw)
         # Schedule UI update on main thread
