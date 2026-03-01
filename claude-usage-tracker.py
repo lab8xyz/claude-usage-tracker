@@ -35,8 +35,11 @@ ICON_SIZE = 24
 APP_ID = "claude-usage-tracker"
 APP_NAME = "Claude Usage Tracker"
 
-# Notification thresholds (percentage)
-NOTIFY_THRESHOLDS = [75, 90, 95]
+# Notification thresholds: every 5% from 75 onwards, each fires once per reset cycle
+NOTIFY_THRESHOLDS = list(range(75, 101, 5))  # [75, 80, 85, 90, 95, 100]
+
+# Daily pacing: alert if weekly usage exceeds expected pace by this many percentage points
+PACE_ALERT_MARGIN = 15
 
 # Colors
 COLOR_GREEN = (0.30, 0.69, 0.31)   # #4CAF50
@@ -85,6 +88,48 @@ def format_time(iso_timestamp):
         return local_time.strftime("%b %d, %I:%M %p")
     except (ValueError, TypeError):
         return "N/A"
+
+
+def normalize_reset_time(iso_timestamp):
+    """Truncate reset time to the minute for stable comparison.
+
+    The API sometimes returns slightly different fractional seconds
+    between polls, which would incorrectly clear notification tracking.
+    """
+    if not iso_timestamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_timestamp)
+        return dt.replace(second=0, microsecond=0).isoformat()
+    except (ValueError, TypeError):
+        return iso_timestamp
+
+
+def calc_weekly_pacing(weekly_pct, weekly_reset_iso):
+    """Calculate daily pacing for weekly usage.
+
+    Returns (days_elapsed, days_total, expected_pct, pace_diff) or None.
+    - days_elapsed: how many days into the 7-day window
+    - expected_pct: what usage % you'd ideally be at for even daily use
+    - pace_diff: actual - expected (positive = ahead/burning fast)
+    """
+    if not weekly_reset_iso:
+        return None
+    try:
+        reset_time = datetime.fromisoformat(weekly_reset_iso)
+        now = datetime.now(timezone.utc)
+        remaining = reset_time - now
+        hours_remaining = max(remaining.total_seconds() / 3600, 0)
+        days_total = 7.0
+        days_remaining = hours_remaining / 24.0
+        days_elapsed = days_total - days_remaining
+        if days_elapsed < 0:
+            days_elapsed = 0
+        expected_pct = (days_elapsed / days_total) * 100
+        pace_diff = weekly_pct - expected_pct
+        return (days_elapsed, days_total, expected_pct, pace_diff)
+    except (ValueError, TypeError):
+        return None
 
 
 # --- Icon Rendering ---
@@ -371,6 +416,43 @@ class UsagePopup(Gtk.Window):
                 self._make_usage_row("Weekly", usage_data.weekly_pct, usage_data.weekly_reset),
                 False, False, 0
             )
+
+            # Weekly pacing indicator
+            pacing = calc_weekly_pacing(usage_data.weekly_pct, usage_data.weekly_reset)
+            if pacing:
+                days_elapsed, days_total, expected_pct, pace_diff = pacing
+                pace_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+                pace_box.set_margin_start(4)
+
+                day_label = Gtk.Label(label=f"Day {days_elapsed:.1f}/7")
+                day_label.get_style_context().add_class("reset-text")
+                day_label.set_halign(Gtk.Align.START)
+
+                if pace_diff > PACE_ALERT_MARGIN:
+                    pace_text = f"  {pace_diff:+.0f}% ahead of pace"
+                    pace_class = "pct-red"
+                elif pace_diff > 5:
+                    pace_text = f"  {pace_diff:+.0f}% ahead of pace"
+                    pace_class = "pct-yellow"
+                elif pace_diff < -5:
+                    pace_text = f"  {abs(pace_diff):.0f}% under pace"
+                    pace_class = "pct-green"
+                else:
+                    pace_text = "  On pace"
+                    pace_class = "pct-green"
+
+                pace_label = Gtk.Label(label=pace_text)
+                pace_label.get_style_context().add_class("usage-pct")
+                pace_label.get_style_context().add_class(pace_class)
+
+                expected_label = Gtk.Label(label=f"  (expected ~{expected_pct:.0f}%)")
+                expected_label.get_style_context().add_class("reset-text")
+
+                pace_box.pack_start(day_label, False, False, 0)
+                pace_box.pack_start(pace_label, False, False, 0)
+                pace_box.pack_start(expected_label, False, False, 0)
+                content_box.pack_start(pace_box, False, False, 0)
+
             if usage_data.opus_pct > 0 or usage_data.raw.get("seven_day_opus"):
                 content_box.pack_start(
                     self._make_usage_row("Opus (weekly)", usage_data.opus_pct, usage_data.opus_reset),
@@ -596,6 +678,7 @@ class ClaudeUsageTracker:
         self.popup = None
         self._notified_session = set()
         self._notified_weekly = set()
+        self._notified_pacing = False
         self._last_session_reset = None
         self._last_weekly_reset = None
 
@@ -715,14 +798,20 @@ class ClaudeUsageTracker:
 
     def _check_notifications(self, usage):
         """Send desktop notifications at usage thresholds."""
-        # Reset notification tracking if the reset window changed
-        if usage.session_reset != self._last_session_reset:
-            self._notified_session.clear()
-            self._last_session_reset = usage.session_reset
-        if usage.weekly_reset != self._last_weekly_reset:
-            self._notified_weekly.clear()
-            self._last_weekly_reset = usage.weekly_reset
+        # Normalize reset times to the minute so slight API variations
+        # don't clear the notification tracking sets
+        norm_session = normalize_reset_time(usage.session_reset)
+        norm_weekly = normalize_reset_time(usage.weekly_reset)
 
+        if norm_session != self._last_session_reset:
+            self._notified_session.clear()
+            self._last_session_reset = norm_session
+        if norm_weekly != self._last_weekly_reset:
+            self._notified_weekly.clear()
+            self._notified_pacing = False
+            self._last_weekly_reset = norm_weekly
+
+        # Threshold notifications: every 5% from 75 onwards, each fires once
         for threshold in NOTIFY_THRESHOLDS:
             if usage.session_pct >= threshold and threshold not in self._notified_session:
                 self._notified_session.add(threshold)
@@ -740,6 +829,21 @@ class ClaudeUsageTracker:
                     f"Resets in {format_countdown(usage.weekly_reset)}.",
                     "dialog-warning" if threshold >= 90 else "dialog-information"
                 )
+
+        # Daily pacing alert: notify once when significantly ahead of pace
+        if not self._notified_pacing:
+            pacing = calc_weekly_pacing(usage.weekly_pct, usage.weekly_reset)
+            if pacing:
+                days_elapsed, _, expected_pct, pace_diff = pacing
+                if pace_diff > PACE_ALERT_MARGIN:
+                    self._notified_pacing = True
+                    self._send_notification(
+                        f"Weekly usage ahead of pace",
+                        f"Day {days_elapsed:.1f}/7: using {usage.weekly_pct:.0f}% "
+                        f"(expected ~{expected_pct:.0f}%). "
+                        f"{pace_diff:.0f}% ahead - you may run out before reset.",
+                        "dialog-warning"
+                    )
 
     def _send_notification(self, title, body, icon_name):
         """Send a desktop notification."""
