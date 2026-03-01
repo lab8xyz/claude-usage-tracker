@@ -31,6 +31,8 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Notify, XApp
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_API_URL = "https://api.anthropic.com/api/oauth/profile"
+ACCOUNT_API_URL = "https://api.anthropic.com/api/oauth/account"
+STATUS_API_URL = "https://status.claude.com/api/v2/status.json"
 POLL_INTERVAL_SECONDS = 60
 ICON_SIZE = 24
 APP_ID = "claude-usage-tracker"
@@ -106,29 +108,41 @@ def normalize_reset_time(iso_timestamp):
         return iso_timestamp
 
 
-def calc_weekly_pacing(weekly_pct, weekly_reset_iso):
-    """Calculate daily pacing for weekly usage.
+def calc_pacing(actual_pct, reset_iso, window_hours):
+    """Calculate pacing for a usage window.
 
-    Returns (days_elapsed, days_total, expected_pct, pace_diff) or None.
-    - days_elapsed: how many days into the 7-day window
-    - expected_pct: what usage % you'd ideally be at for even daily use
+    Args:
+        actual_pct: current utilization percentage
+        reset_iso: ISO timestamp when the window resets
+        window_hours: total window duration in hours (5 for session, 168 for weekly)
+
+    Returns (elapsed, total, unit, expected_pct, pace_diff) or None.
+    - elapsed: time elapsed in the natural unit (hours or days)
+    - total: window size in the natural unit
+    - unit: 'h' or 'd'
+    - expected_pct: ideal usage % for even distribution
     - pace_diff: actual - expected (positive = ahead/burning fast)
     """
-    if not weekly_reset_iso:
+    if not reset_iso:
         return None
     try:
-        reset_time = datetime.fromisoformat(weekly_reset_iso)
+        reset_time = datetime.fromisoformat(reset_iso)
         now = datetime.now(timezone.utc)
         remaining = reset_time - now
         hours_remaining = max(remaining.total_seconds() / 3600, 0)
-        days_total = 7.0
-        days_remaining = hours_remaining / 24.0
-        days_elapsed = days_total - days_remaining
-        if days_elapsed < 0:
-            days_elapsed = 0
-        expected_pct = (days_elapsed / days_total) * 100
-        pace_diff = weekly_pct - expected_pct
-        return (days_elapsed, days_total, expected_pct, pace_diff)
+        hours_elapsed = window_hours - hours_remaining
+        if hours_elapsed < 0:
+            hours_elapsed = 0
+        expected_pct = (hours_elapsed / window_hours) * 100
+        pace_diff = actual_pct - expected_pct
+
+        # Use hours for short windows, days for weekly
+        if window_hours <= 24:
+            return (hours_elapsed, window_hours, "h", expected_pct, pace_diff)
+        else:
+            days_elapsed = hours_elapsed / 24.0
+            days_total = window_hours / 24.0
+            return (days_elapsed, days_total, "d", expected_pct, pace_diff)
     except (ValueError, TypeError):
         return None
 
@@ -300,6 +314,46 @@ class ClaudeAPIClient:
         except Exception:
             pass  # Non-critical, keep using cached values
 
+    def fetch_models(self):
+        """Fetch available models from the account API.
+
+        Returns list of dicts with name, description, active status.
+        """
+        err = self._ensure_token()
+        if err:
+            return []
+        try:
+            resp = requests.get(ACCOUNT_API_URL, headers=self._build_headers(), timeout=10)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            memberships = data.get("memberships", [])
+            # Find the claude_max / chat org
+            for m in memberships:
+                org = m.get("organization", {})
+                caps = org.get("capabilities", [])
+                if "chat" in caps or "claude_max" in caps:
+                    return org.get("claude_ai_bootstrap_models_config", [])
+            return []
+        except Exception:
+            return []
+
+    @staticmethod
+    def fetch_status():
+        """Fetch Claude system status. Returns (indicator, description)."""
+        try:
+            resp = requests.get(STATUS_API_URL, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                status = data.get("status", {})
+                return (
+                    status.get("indicator", "unknown"),
+                    status.get("description", "Unknown"),
+                )
+        except Exception:
+            pass
+        return ("unknown", "Unable to check status")
+
 
 # --- Usage Data Model ---
 
@@ -377,7 +431,7 @@ class UsageData:
 class UsagePopup(Gtk.Window):
     """A popup window showing detailed usage statistics."""
 
-    def __init__(self, usage_data, client, on_refresh):
+    def __init__(self, usage_data, client, on_refresh, models=None, status_indicator=None, status_desc=None):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
         self.set_decorated(False)
@@ -445,46 +499,19 @@ class UsagePopup(Gtk.Window):
                 self._make_usage_row("Session (5h)", usage_data.session_pct, usage_data.session_reset),
                 False, False, 0
             )
+            # Session pacing
+            session_pace = calc_pacing(usage_data.session_pct, usage_data.session_reset, 5)
+            if session_pace:
+                content_box.pack_start(self._make_pace_row(session_pace), False, False, 0)
+
             content_box.pack_start(
                 self._make_usage_row("Weekly", usage_data.weekly_pct, usage_data.weekly_reset),
                 False, False, 0
             )
-
-            # Weekly pacing indicator
-            pacing = calc_weekly_pacing(usage_data.weekly_pct, usage_data.weekly_reset)
-            if pacing:
-                days_elapsed, days_total, expected_pct, pace_diff = pacing
-                pace_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-                pace_box.set_margin_start(4)
-
-                day_label = Gtk.Label(label=f"Day {days_elapsed:.1f}/7")
-                day_label.get_style_context().add_class("reset-text")
-                day_label.set_halign(Gtk.Align.START)
-
-                if pace_diff > PACE_ALERT_MARGIN:
-                    pace_text = f"  {pace_diff:+.0f}% ahead of pace"
-                    pace_class = "pct-red"
-                elif pace_diff > 5:
-                    pace_text = f"  {pace_diff:+.0f}% ahead of pace"
-                    pace_class = "pct-yellow"
-                elif pace_diff < -5:
-                    pace_text = f"  {abs(pace_diff):.0f}% under pace"
-                    pace_class = "pct-green"
-                else:
-                    pace_text = "  On pace"
-                    pace_class = "pct-green"
-
-                pace_label = Gtk.Label(label=pace_text)
-                pace_label.get_style_context().add_class("usage-pct")
-                pace_label.get_style_context().add_class(pace_class)
-
-                expected_label = Gtk.Label(label=f"  (expected ~{expected_pct:.0f}%)")
-                expected_label.get_style_context().add_class("reset-text")
-
-                pace_box.pack_start(day_label, False, False, 0)
-                pace_box.pack_start(pace_label, False, False, 0)
-                pace_box.pack_start(expected_label, False, False, 0)
-                content_box.pack_start(pace_box, False, False, 0)
+            # Weekly pacing
+            weekly_pace = calc_pacing(usage_data.weekly_pct, usage_data.weekly_reset, 168)
+            if weekly_pace:
+                content_box.pack_start(self._make_pace_row(weekly_pace), False, False, 0)
 
             if usage_data.opus_pct > 0 or usage_data.raw.get("seven_day_opus"):
                 content_box.pack_start(
@@ -497,28 +524,93 @@ class UsagePopup(Gtk.Window):
                     False, False, 0
                 )
 
-            # Extra usage / overage spend
-            extra = usage_data.extra_usage
-            if extra:
-                sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-                sep.set_margin_top(4)
-                content_box.pack_start(sep, False, False, 0)
+            main_box.pack_start(content_box, False, False, 0)
 
-                used_cents = extra.get("used_credits", 0) or 0
-                limit_cents = extra.get("monthly_limit", 0) or 0
+            # Extra usage on/off indicator (like status bar)
+            extra_raw = usage_data.raw.get("extra_usage")
+            is_enabled = extra_raw.get("is_enabled", False) if extra_raw else False
+            extra_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            extra_box.get_style_context().add_class("status-bar")
+
+            extra_dot = Gtk.Label()
+            if is_enabled:
+                extra_dot.set_markup('<span foreground="#4CAF50">●</span>')
+                used_cents = (extra_raw.get("used_credits", 0) or 0)
+                limit_cents = (extra_raw.get("monthly_limit", 0) or 0)
                 used = used_cents / 100.0
                 limit = limit_cents / 100.0
-                pct = (used / limit * 100) if limit > 0 else 0
+                status_text = f"Extra Usage On  ({used:.2f} / {limit:.2f} used)"
+            else:
+                extra_dot.set_markup('<span foreground="#F44336">●</span>')
+                status_text = "Extra Usage Off"
 
-                content_box.pack_start(
-                    self._make_usage_row(
-                        f"Extra Usage ({used:.2f} / {limit:.2f})",
-                        pct, None
-                    ),
-                    False, False, 0
-                )
+            extra_label = Gtk.Label(label=status_text)
+            extra_label.get_style_context().add_class("status-text")
+            extra_label.set_halign(Gtk.Align.START)
 
-            main_box.pack_start(content_box, False, False, 0)
+            extra_box.pack_start(extra_dot, False, False, 0)
+            extra_box.pack_start(extra_label, True, True, 0)
+            main_box.pack_start(extra_box, False, False, 0)
+
+        # System status
+        if status_indicator:
+            status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            status_box.get_style_context().add_class("status-bar")
+
+            dot_label = Gtk.Label()
+            if status_indicator == "none":
+                dot_label.set_markup('<span foreground="#4CAF50">●</span>')
+            elif status_indicator == "minor":
+                dot_label.set_markup('<span foreground="#FFC107">●</span>')
+            elif status_indicator in ("major", "critical"):
+                dot_label.set_markup('<span foreground="#F44336">●</span>')
+            else:
+                dot_label.set_markup('<span foreground="#777">●</span>')
+
+            status_text = Gtk.Label(label=status_desc or "Unknown")
+            status_text.get_style_context().add_class("status-text")
+            status_text.set_halign(Gtk.Align.START)
+
+            status_box.pack_start(dot_label, False, False, 0)
+            status_box.pack_start(status_text, True, True, 0)
+            main_box.pack_start(status_box, False, False, 0)
+
+        # Available models
+        if models:
+            models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            models_box.get_style_context().add_class("models-section")
+
+            models_header = Gtk.Label(label="Available Models")
+            models_header.get_style_context().add_class("models-header")
+            models_header.set_halign(Gtk.Align.START)
+            models_box.pack_start(models_header, False, False, 0)
+
+            for model in models:
+                if model.get("inactive"):
+                    continue
+                name = model.get("name", model.get("model", "Unknown"))
+                desc = (model.get("description") or "").strip()
+                overflow = model.get("overflow", False)
+
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                name_label = Gtk.Label(label=name)
+                name_label.get_style_context().add_class("model-name")
+                name_label.set_halign(Gtk.Align.START)
+                row.pack_start(name_label, False, False, 0)
+
+                if desc:
+                    desc_label = Gtk.Label(label=desc)
+                    desc_label.get_style_context().add_class("model-desc")
+                    row.pack_start(desc_label, False, False, 0)
+
+                if overflow:
+                    overflow_label = Gtk.Label(label="older")
+                    overflow_label.get_style_context().add_class("model-overflow")
+                    row.pack_end(overflow_label, False, False, 0)
+
+                models_box.pack_start(row, False, False, 0)
+
+            main_box.pack_start(models_box, False, False, 0)
 
         # Footer
         footer_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -590,6 +682,42 @@ class UsagePopup(Gtk.Window):
             box.pack_start(reset_label, False, False, 0)
 
         return box
+
+    def _make_pace_row(self, pacing):
+        """Create a pacing indicator row from calc_pacing() output."""
+        elapsed, total, unit, expected_pct, pace_diff = pacing
+        pace_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        pace_box.set_margin_start(4)
+
+        unit_label = "Hour" if unit == "h" else "Day"
+        time_label = Gtk.Label(label=f"{unit_label} {elapsed:.1f}/{total:.0f}")
+        time_label.get_style_context().add_class("reset-text")
+        time_label.set_halign(Gtk.Align.START)
+
+        if pace_diff > PACE_ALERT_MARGIN:
+            pace_text = f"  {pace_diff:+.0f}% ahead"
+            pace_class = "pct-red"
+        elif pace_diff > 5:
+            pace_text = f"  {pace_diff:+.0f}% ahead"
+            pace_class = "pct-yellow"
+        elif pace_diff < -5:
+            pace_text = f"  {abs(pace_diff):.0f}% under"
+            pace_class = "pct-green"
+        else:
+            pace_text = "  On pace"
+            pace_class = "pct-green"
+
+        pace_label = Gtk.Label(label=pace_text)
+        pace_label.get_style_context().add_class("usage-pct")
+        pace_label.get_style_context().add_class(pace_class)
+
+        expected_label = Gtk.Label(label=f"  (expected ~{expected_pct:.0f}%)")
+        expected_label.get_style_context().add_class("reset-text")
+
+        pace_box.pack_start(time_label, False, False, 0)
+        pace_box.pack_start(pace_label, False, False, 0)
+        pace_box.pack_start(expected_label, False, False, 0)
+        return pace_box
 
     def _get_css(self):
         return """
@@ -673,6 +801,39 @@ class UsagePopup(Gtk.Window):
         .refresh-btn:hover {
             background: #444;
         }
+        .status-bar {
+            padding: 6px 16px;
+            background: #232323;
+        }
+        .status-text {
+            font-size: 11px;
+            color: #b0b0b0;
+        }
+        .models-section {
+            padding: 8px 16px;
+            background: #1e1e1e;
+        }
+        .models-header {
+            font-size: 11px;
+            font-weight: bold;
+            color: #888;
+            margin-bottom: 2px;
+        }
+        .model-name {
+            font-size: 11px;
+            color: #ccc;
+        }
+        .model-desc {
+            font-size: 10px;
+            color: #666;
+        }
+        .model-overflow {
+            font-size: 9px;
+            color: #555;
+            background: #2a2a2a;
+            padding: 0px 4px;
+            border-radius: 3px;
+        }
         """
 
     def position_near(self, x, y, panel_position=None):
@@ -711,6 +872,9 @@ class ClaudeUsageTracker:
         self.client = ClaudeAPIClient()
         self.usage = UsageData()
         self.popup = None
+        self.models = []
+        self.status_indicator = "none"
+        self.status_desc = "Checking..."
         self._notified_session = set()
         self._notified_weekly = set()
         self._notified_pacing = False
@@ -788,7 +952,12 @@ class ClaudeUsageTracker:
             self.popup = None
             return
 
-        self.popup = UsagePopup(self.usage, self.client, self._trigger_refresh)
+        self.popup = UsagePopup(
+            self.usage, self.client, self._trigger_refresh,
+            models=self.models,
+            status_indicator=self.status_indicator,
+            status_desc=self.status_desc,
+        )
         self.popup.position_near(self._last_click_x, self._last_click_y, getattr(self, '_panel_position', None))
 
     def _trigger_refresh(self):
@@ -811,19 +980,30 @@ class ClaudeUsageTracker:
         self.client.refresh_plan_info()
         raw = self.client.fetch_usage()
         usage = UsageData(raw)
+        models = self.client.fetch_models()
+        status_indicator, status_desc = self.client.fetch_status()
         # Schedule UI update on main thread
-        GLib.idle_add(self._apply_update, usage)
+        GLib.idle_add(self._apply_update, usage, models, status_indicator, status_desc)
 
-    def _apply_update(self, usage):
+    def _apply_update(self, usage, models=None, status_indicator=None, status_desc=None):
         """Apply fetched data to UI (must run on main thread)."""
         self.usage = usage
+        if models is not None:
+            self.models = models
+        if status_indicator is not None:
+            self.status_indicator = status_indicator
+            self.status_desc = status_desc
 
         if usage.ok:
             self._update_icon(usage.session_pct)
+            status_line = ""
+            if self.status_indicator and self.status_indicator != "none":
+                status_line = f"\nStatus: {self.status_desc}"
             self.icon.set_tooltip_text(
                 f"Session: {usage.session_pct:.1f}% | "
                 f"Weekly: {usage.weekly_pct:.1f}%\n"
                 f"Session resets: {format_countdown(usage.session_reset)}"
+                f"{status_line}"
             )
             self._check_notifications(usage)
         else:
@@ -866,16 +1046,17 @@ class ClaudeUsageTracker:
                     "dialog-warning" if threshold >= 90 else "dialog-information"
                 )
 
-        # Daily pacing alert: notify once when significantly ahead of pace
+        # Pacing alerts: notify once when significantly ahead of pace
         if not self._notified_pacing:
-            pacing = calc_weekly_pacing(usage.weekly_pct, usage.weekly_reset)
+            pacing = calc_pacing(usage.weekly_pct, usage.weekly_reset, 168)
             if pacing:
-                days_elapsed, _, expected_pct, pace_diff = pacing
+                elapsed, total, unit, expected_pct, pace_diff = pacing
                 if pace_diff > PACE_ALERT_MARGIN:
                     self._notified_pacing = True
+                    unit_label = "Hour" if unit == "h" else "Day"
                     self._send_notification(
                         f"Weekly usage ahead of pace",
-                        f"Day {days_elapsed:.1f}/7: using {usage.weekly_pct:.0f}% "
+                        f"{unit_label} {elapsed:.1f}/{total:.0f}: using {usage.weekly_pct:.0f}% "
                         f"(expected ~{expected_pct:.0f}%). "
                         f"{pace_diff:.0f}% ahead - you may run out before reset.",
                         "dialog-warning"
