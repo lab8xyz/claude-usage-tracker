@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Usage Tracker
+Comment=Monitor Claude AI usage limits in the system tray
+Exec=/home/mark/Programming/claudeuseage/claude-usage-tracker.py
+Icon=dialog-information
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
