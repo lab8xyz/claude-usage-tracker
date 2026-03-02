@@ -252,7 +252,7 @@ def main():
 
     if "_error" in usage:
         # Fallback: just show model + context + branch
-        branch_part = f" | \ue0a0 {CYAN}{branch}{RESET}" if branch else ""
+        branch_part = f" | \u2387  {CYAN}{branch}{RESET}" if branch else ""
         print(f" {BOLD}Claude Usage{RESET}{branch_part} | £{total_cost:.2f} | ctx {ctx_pct}% | {DIM}{usage['_error']}{RESET}")
         return
 
@@ -279,8 +279,8 @@ def main():
     else:
         status_dot = f"{DIM}●{RESET}"
 
-    # Branch with git icon (U+E0A0 Powerline branch symbol)
-    branch_part = f" | \ue0a0 {CYAN}{branch}{RESET}" if branch else ""
+    # Branch with git icon (U+2387 Alternative Key Symbol)
+    branch_part = f" | \u2387  {CYAN}{branch}{RESET}" if branch else ""
 
     # Line 1: Progress bars
     bar_parts = [

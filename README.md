@@ -95,6 +95,34 @@ The app uses the same OAuth token that Claude Code CLI stores in `~/.claude/.cre
 | `/api/oauth/account` | Available models list |
 | `status.claude.com/api/v2/status.json` | Claude system status |
 
+## Claude Code Statusline
+
+A companion script that displays usage info directly in the Claude Code terminal statusline.
+
+```
+ 5h: 26% ██░░░░░░░░ | 7d: 32% ███░░░░░░░ | ctx: 45% ███░░░░░
+ ● Claude Usage | ⎇ master | Opus £1.23 | → Reset: 12:00 PM
+```
+
+**Line 1** — Progress bars for session (5h), weekly (7d), and context window usage, color-coded green/yellow/red.
+
+**Line 2** — Claude system status dot, git branch, model name, session cost, and next reset time.
+
+### Statusline Installation
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 /path/to/claude-statusline.py"
+  }
+}
+```
+
+Requires `requests` (`pip install requests`). Usage data is cached for 60 seconds at `/tmp/claude-statusline-cache.json` to avoid excessive API calls.
+
 ## License
 
 MIT
