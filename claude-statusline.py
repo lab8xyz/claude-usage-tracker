@@ -288,7 +288,7 @@ def main():
         f"7d: {weekly_pct:.0f}% {make_bar(weekly_pct, 10)}",
         f"ctx: {ctx_pct}% {make_bar(ctx_pct, 8)}",
     ]
-    print("  ".join(bar_parts))
+    print(" | ".join(bar_parts))
 
     # Line 2: Info
     info_parts = [
