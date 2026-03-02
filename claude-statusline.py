@@ -209,7 +209,7 @@ def main():
 
     if "_error" in usage:
         # Fallback: just show model + context
-        print(f" {BOLD}{model_name}{RESET} | ${total_cost:.2f} | ctx {ctx_pct}% | {DIM}usage: {usage['_error']}{RESET}")
+        print(f" {BOLD}{model_name}{RESET} | £{total_cost:.2f} | ctx {ctx_pct}% | {DIM}usage: {usage['_error']}{RESET}")
         return
 
     # Parse usage
@@ -242,7 +242,7 @@ def main():
     # Build output line
     parts = [
         f" {status_dot} {BOLD}{model_name}{RESET}",
-        f"${total_cost:.2f}",
+        f"£{total_cost:.2f}",
         f"ctx {ctx_color}{ctx_pct}%{RESET}",
         f"5h: {color_for_pct(session_pct)}{session_pct:.0f}%{RESET}{session_pace_ind} ({format_countdown(session_reset)})",
         f"7d: {color_for_pct(weekly_pct)}{weekly_pct:.0f}%{RESET}{weekly_pace_ind} ({format_countdown(weekly_reset)})",
