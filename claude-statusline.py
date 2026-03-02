@@ -252,7 +252,7 @@ def main():
 
     if "_error" in usage:
         # Fallback: just show model + context + branch
-        branch_part = f" {DIM}/{RESET} {CYAN}{branch}{RESET}" if branch else ""
+        branch_part = f" | \ue0a0 {CYAN}{branch}{RESET}" if branch else ""
         print(f" {BOLD}Claude Usage{RESET}{branch_part} | £{total_cost:.2f} | ctx {ctx_pct}% | {DIM}{usage['_error']}{RESET}")
         return
 
@@ -279,20 +279,24 @@ def main():
     else:
         status_dot = f"{DIM}●{RESET}"
 
-    # Branch
-    branch_part = f" {DIM}/{RESET} {CYAN}{branch}{RESET}" if branch else ""
+    # Branch with git icon (U+E0A0 Powerline branch symbol)
+    branch_part = f" | \ue0a0 {CYAN}{branch}{RESET}" if branch else ""
 
-    # Build output - matching screenshot style with bars
-    parts = [
+    # Line 1: Progress bars
+    bar_parts = [
+        f" 5h: {session_pct:.0f}% {make_bar(session_pct, 10)}{session_pace_ind}",
+        f"7d: {weekly_pct:.0f}% {make_bar(weekly_pct, 10)}{weekly_pace_ind}",
+        f"ctx: {ctx_pct}% {make_bar(ctx_pct, 8)}",
+    ]
+    print("  ".join(bar_parts))
+
+    # Line 2: Info
+    info_parts = [
         f" {status_dot} {BOLD}Claude Usage{RESET}{branch_part}",
         f"{model_name} £{total_cost:.2f}",
-        f"5h: {session_pct:.0f}% {make_bar(session_pct, 8)}{session_pace_ind}",
-        f"7d: {weekly_pct:.0f}% {make_bar(weekly_pct, 8)}{weekly_pace_ind}",
-        f"ctx: {ctx_pct}% {make_bar(ctx_pct, 6)}",
         f"→ Reset: {format_reset_time(session_reset)}",
     ]
-
-    print(" | ".join(parts))
+    print(" | ".join(info_parts))
 
 
 if __name__ == "__main__":
