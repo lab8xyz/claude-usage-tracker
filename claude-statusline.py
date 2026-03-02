@@ -14,6 +14,7 @@ Install: Add to ~/.claude/settings.json:
 
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -98,6 +99,32 @@ def pace_indicator(pace_diff):
     if pace_diff < -5:
         return f"{GREEN}-{RESET}"
     return f"{GREEN}={RESET}"
+
+
+def get_git_branch():
+    """Get the current git branch name."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def format_reset_time(iso_timestamp):
+    """Format reset time as local HH:MM AM/PM."""
+    if not iso_timestamp:
+        return ""
+    try:
+        reset_time = datetime.fromisoformat(iso_timestamp)
+        local_time = reset_time.astimezone()
+        return local_time.strftime("%I:%M %p")
+    except (ValueError, TypeError):
+        return ""
 
 
 def load_credentials():
@@ -207,9 +234,26 @@ def main():
     # Fetch usage data (cached)
     usage = fetch_usage_cached()
 
+    # Git branch
+    cwd = stdin_data.get("cwd") or stdin_data.get("workspace", {}).get("current_dir")
+    branch = None
+    if cwd:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=2, cwd=cwd
+            )
+            if result.returncode == 0:
+                branch = result.stdout.strip()
+        except Exception:
+            pass
+    if not branch:
+        branch = get_git_branch()
+
     if "_error" in usage:
-        # Fallback: just show model + context
-        print(f" {BOLD}{model_name}{RESET} | £{total_cost:.2f} | ctx {ctx_pct}% | {DIM}usage: {usage['_error']}{RESET}")
+        # Fallback: just show model + context + branch
+        branch_part = f" {DIM}/{RESET} {CYAN}{branch}{RESET}" if branch else ""
+        print(f" {BOLD}Claude Usage{RESET}{branch_part} | £{total_cost:.2f} | ctx {ctx_pct}% | {DIM}{usage['_error']}{RESET}")
         return
 
     # Parse usage
@@ -221,12 +265,8 @@ def main():
     # Pacing
     session_pace = calc_pacing(session_pct, session_reset, 5)
     weekly_pace = calc_pacing(weekly_pct, weekly_reset, 168)
-
     session_pace_ind = pace_indicator(session_pace[4]) if session_pace else ""
     weekly_pace_ind = pace_indicator(weekly_pace[4]) if weekly_pace else ""
-
-    # Context bar
-    ctx_color = color_for_pct(ctx_pct)
 
     # Status indicator
     status = usage.get("_status", "unknown")
@@ -239,13 +279,17 @@ def main():
     else:
         status_dot = f"{DIM}●{RESET}"
 
-    # Build output line
+    # Branch
+    branch_part = f" {DIM}/{RESET} {CYAN}{branch}{RESET}" if branch else ""
+
+    # Build output - matching screenshot style with bars
     parts = [
-        f" {status_dot} {BOLD}{model_name}{RESET}",
-        f"£{total_cost:.2f}",
-        f"ctx {ctx_color}{ctx_pct}%{RESET}",
-        f"5h: {color_for_pct(session_pct)}{session_pct:.0f}%{RESET}{session_pace_ind} ({format_countdown(session_reset)})",
-        f"7d: {color_for_pct(weekly_pct)}{weekly_pct:.0f}%{RESET}{weekly_pace_ind} ({format_countdown(weekly_reset)})",
+        f" {status_dot} {BOLD}Claude Usage{RESET}{branch_part}",
+        f"{model_name} £{total_cost:.2f}",
+        f"5h: {session_pct:.0f}% {make_bar(session_pct, 8)}{session_pace_ind}",
+        f"7d: {weekly_pct:.0f}% {make_bar(weekly_pct, 8)}{weekly_pace_ind}",
+        f"ctx: {ctx_pct}% {make_bar(ctx_pct, 6)}",
+        f"→ Reset: {format_reset_time(session_reset)}",
     ]
 
     print(" | ".join(parts))
