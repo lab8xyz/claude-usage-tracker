@@ -284,7 +284,7 @@ def main():
 
     # Line 1: Progress bars
     bar_parts = [
-        f" 5h: {session_pct:.0f}% {make_bar(session_pct, 10)}{session_pace_ind}",
+        f" 5h: {session_pct:.0f}% {make_bar(session_pct, 10)}",
         f"7d: {weekly_pct:.0f}% {make_bar(weekly_pct, 10)}{weekly_pace_ind}",
         f"ctx: {ctx_pct}% {make_bar(ctx_pct, 8)}",
     ]
