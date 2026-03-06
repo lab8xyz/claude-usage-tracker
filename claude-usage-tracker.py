@@ -893,6 +893,7 @@ class ClaudeUsageTracker:
         self._last_session_reset = None
         self._last_weekly_reset = None
         self._poll_count = 0
+        self._last_fetch_time = 0
 
         # Initialize notifications
         Notify.init(APP_ID)
@@ -990,6 +991,11 @@ class ClaudeUsageTracker:
 
     def _fetch_and_update(self):
         """Fetch usage data and update UI (runs in background thread)."""
+        # Guard against burst calls after suspend/resume
+        now = time.time()
+        if now - self._last_fetch_time < 30:
+            return
+        self._last_fetch_time = now
         self._poll_count += 1
         # Refresh plan info and models every 10 polls (~10 min) to reduce API calls
         if self._poll_count % 10 == 1:
