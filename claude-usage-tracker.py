@@ -218,6 +218,7 @@ class ClaudeAPIClient:
         self.expires_at = 0
         self.subscription_type = None
         self.rate_limit_tier = None
+        self._backoff_until = 0
         self._load_credentials()
 
     def _load_credentials(self):
@@ -272,6 +273,9 @@ class ClaudeAPIClient:
 
     def fetch_usage(self):
         """Fetch usage data from the API. Returns dict or None on error."""
+        if time.time() < self._backoff_until:
+            remaining = int(self._backoff_until - time.time())
+            return {"error": f"Rate limited, retrying in {remaining}s"}
         err = self._ensure_token()
         if err:
             return err
@@ -283,6 +287,10 @@ class ClaudeAPIClient:
                 return {"error": "Authentication failed (401). Try: claude login"}
             if resp.status_code == 403:
                 return {"error": "Access forbidden (403). Check your plan."}
+            if resp.status_code == 429:
+                retry_after = max(120, int(resp.headers.get("Retry-After", 120)))
+                self._backoff_until = time.time() + retry_after
+                return {"error": f"Rate limited (429). Backing off {retry_after}s"}
             resp.raise_for_status()
             return resp.json()
         except requests.ConnectionError:
@@ -884,6 +892,7 @@ class ClaudeUsageTracker:
         self._notified_weekly_pace = set()
         self._last_session_reset = None
         self._last_weekly_reset = None
+        self._poll_count = 0
 
         # Initialize notifications
         Notify.init(APP_ID)
@@ -981,10 +990,13 @@ class ClaudeUsageTracker:
 
     def _fetch_and_update(self):
         """Fetch usage data and update UI (runs in background thread)."""
-        self.client.refresh_plan_info()
+        self._poll_count += 1
+        # Refresh plan info and models every 10 polls (~10 min) to reduce API calls
+        if self._poll_count % 10 == 1:
+            self.client.refresh_plan_info()
         raw = self.client.fetch_usage()
         usage = UsageData(raw)
-        models = self.client.fetch_models()
+        models = self.client.fetch_models() if self._poll_count % 10 == 1 else self.models
         status_indicator, status_desc = self.client.fetch_status()
         # Schedule UI update on main thread
         GLib.idle_add(self._apply_update, usage, models, status_indicator, status_desc)

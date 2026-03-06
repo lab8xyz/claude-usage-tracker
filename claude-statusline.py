@@ -162,6 +162,9 @@ def fetch_usage_cached():
             "anthropic-beta": "oauth-2025-04-20",
         }
         resp = requests.get(USAGE_API_URL, headers=headers, timeout=10)
+        if resp.status_code == 429:
+            # Don't cache errors — let the TTL of any existing valid cache protect us
+            return {"_error": "rate limited (429)"}
         if resp.status_code != 200:
             return {"_error": f"HTTP {resp.status_code}"}
         data = resp.json()
