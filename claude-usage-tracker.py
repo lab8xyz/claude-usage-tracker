@@ -522,7 +522,11 @@ class UsagePopup(Gtk.Window):
         self.set_border_width(0)
         self.on_refresh = on_refresh
 
-        # Close on focus loss
+        # Auto-close 10s after mouse leaves; cancel timer if mouse re-enters
+        self._close_timer_id = None
+        self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        self.connect("enter-notify-event", self._on_mouse_enter)
+        self.connect("leave-notify-event", self._on_mouse_leave)
         self.connect("focus-out-event", lambda w, e: w.destroy())
 
         # Style the window
@@ -713,6 +717,21 @@ class UsagePopup(Gtk.Window):
         frame.add(main_box)
         self.add(frame)
         self.show_all()
+
+    def _on_mouse_enter(self, widget, event):
+        if self._close_timer_id is not None:
+            GLib.source_remove(self._close_timer_id)
+            self._close_timer_id = None
+
+    def _on_mouse_leave(self, widget, event):
+        if self._close_timer_id is not None:
+            GLib.source_remove(self._close_timer_id)
+        self._close_timer_id = GLib.timeout_add_seconds(10, self._auto_close)
+
+    def _auto_close(self):
+        self._close_timer_id = None
+        self.destroy()
+        return False
 
     def _on_refresh_clicked(self, button):
         self.destroy()
