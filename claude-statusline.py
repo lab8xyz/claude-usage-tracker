@@ -20,11 +20,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
-USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
-STATUS_API_URL = "https://status.claude.com/api/v2/status.json"
 CACHE_PATH = Path("/tmp/claude-statusline-cache.json")
-CACHE_TTL_SECONDS = 60
 
 # ANSI color codes
 RESET = "\033[0m"
@@ -34,6 +30,7 @@ RED = "\033[31m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 BLUE = "\033[34m"
+MAGENTA = "\033[35m"
 CYAN = "\033[36m"
 WHITE = "\033[37m"
 BG_RED = "\033[41m"
@@ -127,67 +124,22 @@ def format_reset_time(iso_timestamp):
         return ""
 
 
-def load_credentials():
-    try:
-        with open(CREDENTIALS_PATH) as f:
-            creds = json.load(f)
-        oauth = creds.get("claudeAiOauth", {})
-        return oauth.get("accessToken")
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return None
-
-
 def fetch_usage_cached():
-    """Fetch usage data with file-based caching."""
-    # Check cache
+    """Read usage data from shared cache written by the tray app.
+
+    Only the tray app calls the API — the statusline just reads from cache
+    to avoid burning through the very low per-token rate limit (~5 requests).
+    """
     try:
         if CACHE_PATH.exists():
             cache = json.loads(CACHE_PATH.read_text())
-            if time.time() - cache.get("_ts", 0) < CACHE_TTL_SECONDS:
+            age = time.time() - cache.get("_ts", 0)
+            if age < 600:  # Accept cache up to 10 min old
                 return cache
+            return {"_error": f"cache stale ({int(age)}s)"}
     except (json.JSONDecodeError, OSError):
         pass
-
-    # Fetch fresh
-    token = load_credentials()
-    if not token:
-        return {"_error": "no token"}
-
-    try:
-        import requests
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.5",
-            "anthropic-beta": "oauth-2025-04-20",
-        }
-        resp = requests.get(USAGE_API_URL, headers=headers, timeout=10)
-        if resp.status_code == 429:
-            # Don't cache errors — let the TTL of any existing valid cache protect us
-            return {"_error": "rate limited (429)"}
-        if resp.status_code != 200:
-            return {"_error": f"HTTP {resp.status_code}"}
-        data = resp.json()
-        data["_ts"] = time.time()
-
-        # Also fetch status
-        try:
-            sr = requests.get(STATUS_API_URL, timeout=5)
-            if sr.status_code == 200:
-                sd = sr.json()
-                data["_status"] = sd.get("status", {}).get("indicator", "unknown")
-        except Exception:
-            data["_status"] = "unknown"
-
-        # Write cache
-        try:
-            CACHE_PATH.write_text(json.dumps(data))
-        except OSError:
-            pass
-
-        return data
-    except Exception as e:
-        return {"_error": str(e)}
+    return {"_error": "no data (is tray app running?)"}
 
 
 def get_utilization(data, key):
@@ -283,7 +235,9 @@ def main():
         status_dot = f"{DIM}●{RESET}"
 
     # Branch with git icon (U+2387 Alternative Key Symbol)
+    cwd_name = os.path.basename(cwd) if cwd else ""
     branch_part = f" | \u2387  {CYAN}{branch}{RESET}" if branch else ""
+    cwd_part = f" | {MAGENTA}{cwd_name}{RESET}" if cwd_name else ""
 
     # Line 1: Progress bars
     bar_parts = [
@@ -295,7 +249,7 @@ def main():
 
     # Line 2: Info
     info_parts = [
-        f" {status_dot} {BOLD}Claude Usage{RESET}{branch_part}",
+        f" {status_dot} {BOLD}Claude Usage{RESET}{branch_part}{cwd_part}",
         f"{model_name} £{total_cost:.2f}",
         f"→ Reset: {format_reset_time(session_reset)}",
     ]

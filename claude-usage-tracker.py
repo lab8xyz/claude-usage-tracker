@@ -9,6 +9,7 @@ import json
 import math
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -33,7 +34,8 @@ USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_API_URL = "https://api.anthropic.com/api/oauth/profile"
 ACCOUNT_API_URL = "https://api.anthropic.com/api/oauth/account"
 STATUS_API_URL = "https://status.claude.com/api/v2/status.json"
-POLL_INTERVAL_SECONDS = 60
+POLL_INTERVAL_SECONDS = 180
+STATUSLINE_CACHE_PATH = Path("/tmp/claude-statusline-cache.json")
 ICON_SIZE = 24
 APP_ID = "claude-usage-tracker"
 APP_NAME = "Claude Usage Tracker"
@@ -219,6 +221,7 @@ class ClaudeAPIClient:
         self.subscription_type = None
         self.rate_limit_tier = None
         self._backoff_until = 0
+        self._claude_version = self._get_claude_version()
         self._load_credentials()
 
     def _load_credentials(self):
@@ -243,6 +246,55 @@ class ClaudeAPIClient:
         """Reload credentials from disk (in case of token refresh)."""
         self._load_credentials()
 
+    def _refresh_token(self):
+        """Refresh the OAuth token to get a new access token with fresh rate limits.
+
+        Each access token has a very low rate limit (~5 requests) on the usage
+        endpoint. Refreshing gives us a new token with a fresh budget.
+        Note: refresh tokens are single-use, so we must save the new one.
+        """
+        try:
+            with open(CREDENTIALS_PATH, "r") as f:
+                creds = json.load(f)
+            oauth = creds.get("claudeAiOauth", {})
+            refresh_token = oauth.get("refreshToken")
+            if not refresh_token:
+                return False
+
+            resp = requests.post(
+                "https://console.anthropic.com/v1/oauth/token",
+                json={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return False
+
+            data = resp.json()
+            new_access = data.get("access_token")
+            new_refresh = data.get("refresh_token")
+            if not new_access or not new_refresh:
+                return False
+
+            # Update credentials file
+            oauth["accessToken"] = new_access
+            oauth["refreshToken"] = new_refresh
+            oauth["expiresAt"] = int(time.time() * 1000) + data.get("expires_in", 3600) * 1000
+            creds["claudeAiOauth"] = oauth
+            with open(CREDENTIALS_PATH, "w") as f:
+                json.dump(creds, f, indent=2)
+
+            # Update in-memory state
+            self.access_token = new_access
+            self.expires_at = oauth["expiresAt"]
+            return True
+        except Exception:
+            return False
+
     def is_token_expired(self):
         """Check if the OAuth token has expired."""
         if not self.expires_at:
@@ -250,12 +302,23 @@ class ClaudeAPIClient:
         # expiresAt is in milliseconds
         return time.time() * 1000 >= self.expires_at
 
+    @staticmethod
+    def _get_claude_version():
+        """Get installed Claude Code version."""
+        try:
+            result = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                return result.stdout.strip().split()[0]
+        except Exception:
+            pass
+        return "2.1.5"
+
     def _build_headers(self):
         """Build authenticated request headers."""
         return {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.5",
+            "User-Agent": f"claude-code/{self._claude_version}",
             "anthropic-beta": "oauth-2025-04-20",
         }
 
@@ -288,9 +351,15 @@ class ClaudeAPIClient:
             if resp.status_code == 403:
                 return {"error": "Access forbidden (403). Check your plan."}
             if resp.status_code == 429:
-                retry_after = max(120, int(resp.headers.get("Retry-After", 120)))
-                self._backoff_until = time.time() + retry_after
-                return {"error": f"Rate limited (429). Backing off {retry_after}s"}
+                # Try refreshing the token for a fresh rate limit budget
+                if self._refresh_token():
+                    # Retry once with new token
+                    resp = requests.get(USAGE_API_URL, headers=self._build_headers(), timeout=15)
+                    if resp.status_code == 200:
+                        return resp.json()
+                # Still failing — back off
+                self._backoff_until = time.time() + 180
+                return {"error": "Rate limited (429). Backing off 180s"}
             resp.raise_for_status()
             return resp.json()
         except requests.ConnectionError:
@@ -910,7 +979,7 @@ class ClaudeUsageTracker:
         # Right-click menu
         menu = Gtk.Menu()
         item_refresh = Gtk.MenuItem.new_with_label("Refresh Now")
-        item_refresh.connect("activate", lambda _: self._trigger_refresh())
+        item_refresh.connect("activate", lambda _: self._trigger_refresh(force=True))
         menu.append(item_refresh)
 
         menu.append(Gtk.SeparatorMenuItem())
@@ -967,16 +1036,16 @@ class ClaudeUsageTracker:
             return
 
         self.popup = UsagePopup(
-            self.usage, self.client, self._trigger_refresh,
+            self.usage, self.client, lambda: self._trigger_refresh(force=True),
             models=self.models,
             status_indicator=self.status_indicator,
             status_desc=self.status_desc,
         )
         self.popup.position_near(self._last_click_x, self._last_click_y, getattr(self, '_panel_position', None))
 
-    def _trigger_refresh(self):
+    def _trigger_refresh(self, force=False):
         """Trigger an immediate refresh in a background thread."""
-        thread = threading.Thread(target=self._fetch_and_update, daemon=True)
+        thread = threading.Thread(target=self._fetch_and_update, args=(force,), daemon=True)
         thread.start()
 
     def _initial_fetch(self):
@@ -989,19 +1058,31 @@ class ClaudeUsageTracker:
         self._trigger_refresh()
         return True  # Keep repeating
 
-    def _fetch_and_update(self):
+    def _fetch_and_update(self, force=False):
         """Fetch usage data and update UI (runs in background thread)."""
-        # Guard against burst calls after suspend/resume
+        # Guard against burst calls after suspend/resume (skip on manual refresh)
         now = time.time()
-        if now - self._last_fetch_time < 30:
+        if not force and now - self._last_fetch_time < 30:
             return
         self._last_fetch_time = now
+        if force:
+            # Manual refresh: reload credentials from disk and clear backoff
+            self.client.reload_credentials()
+            self.client._backoff_until = 0
         self._poll_count += 1
         # Refresh plan info and models every 10 polls (~10 min) to reduce API calls
         if self._poll_count % 10 == 1:
             self.client.refresh_plan_info()
         raw = self.client.fetch_usage()
         usage = UsageData(raw)
+        # Write successful usage data to shared cache for statusline
+        if usage.ok:
+            try:
+                cache_data = dict(raw)
+                cache_data["_ts"] = time.time()
+                STATUSLINE_CACHE_PATH.write_text(json.dumps(cache_data))
+            except OSError:
+                pass
         models = self.client.fetch_models() if self._poll_count % 10 == 1 else self.models
         status_indicator, status_desc = self.client.fetch_status()
         # Schedule UI update on main thread
