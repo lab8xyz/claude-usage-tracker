@@ -101,7 +101,7 @@ A companion script that displays usage info directly in the Claude Code terminal
 
 ```
  5h: 26% ██░░░░░░░░ | 7d: 32% ███░░░░░░░ | ctx: 45% ███░░░░░
- ● Claude Usage | ⎇ master | Opus £1.23 | → Reset: 12:00 PM
+ ● Claude Usage | ⎇ master | Opus £1.23 | → Reset: 12:00
 ```
 
 **Line 1** — Progress bars for session (5h), weekly (7d), and context window usage, color-coded green/yellow/red.

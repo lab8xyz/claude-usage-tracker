@@ -113,13 +113,13 @@ def get_git_branch():
 
 
 def format_reset_time(iso_timestamp):
-    """Format reset time as local HH:MM AM/PM."""
+    """Format reset time as local HH:MM (24h)."""
     if not iso_timestamp:
         return ""
     try:
         reset_time = datetime.fromisoformat(iso_timestamp)
         local_time = reset_time.astimezone()
-        return local_time.strftime("%I:%M %p")
+        return local_time.strftime("%H:%M")
     except (ValueError, TypeError):
         return ""
 

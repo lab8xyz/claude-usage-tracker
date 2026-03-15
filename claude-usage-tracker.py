@@ -93,7 +93,7 @@ def format_time(iso_timestamp):
     try:
         reset_time = datetime.fromisoformat(iso_timestamp)
         local_time = reset_time.astimezone()
-        return local_time.strftime("%b %d, %I:%M %p")
+        return local_time.strftime("%b %d, %H:%M")
     except (ValueError, TypeError):
         return "N/A"
 
@@ -697,7 +697,7 @@ class UsagePopup(Gtk.Window):
         footer_box.get_style_context().add_class("popup-footer")
 
         updated_label = Gtk.Label(
-            label=f"Updated: {usage_data.last_updated.strftime('%I:%M:%S %p')}"
+            label=f"Updated: {usage_data.last_updated.strftime('%H:%M:%S')}"
         )
         updated_label.get_style_context().add_class("footer-text")
         updated_label.set_halign(Gtk.Align.START)
