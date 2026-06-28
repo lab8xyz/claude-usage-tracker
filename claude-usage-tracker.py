@@ -299,8 +299,9 @@ class ClaudeAPIClient:
         """Check if the OAuth token has expired."""
         if not self.expires_at:
             return True
-        # expiresAt is in milliseconds
-        return time.time() * 1000 >= self.expires_at
+        # expiresAt is in milliseconds. Refresh 60s early so a token never
+        # lapses mid-request (which would 401).
+        return time.time() * 1000 >= self.expires_at - 60_000
 
     @staticmethod
     def _get_claude_version():
@@ -329,8 +330,12 @@ class ClaudeAPIClient:
             if not self.access_token:
                 return {"error": "No credentials. Run: claude login"}
         if self.is_token_expired():
+            # Token expired locally. First reload from disk in case the Claude
+            # Code CLI refreshed it, then refresh it ourselves using the stored
+            # refresh token. This is needed when Claude isn't being used locally
+            # (e.g. working remotely), since nothing else refreshes the token.
             self.reload_credentials()
-            if self.is_token_expired():
+            if self.is_token_expired() and not self._refresh_token():
                 return {"error": "Token expired. Re-login with: claude login"}
         return None
 
