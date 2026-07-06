@@ -49,7 +49,8 @@ PACE_FIRST_THRESHOLD = 10
 # Colors
 COLOR_GREEN = (0.30, 0.69, 0.31)   # #4CAF50
 COLOR_YELLOW = (1.0, 0.76, 0.03)   # #FFC107
-COLOR_RED = (0.96, 0.26, 0.21)     # #F44336
+COLOR_RED = (0.96, 0.26, 0.21)     # #F44336 - "at limit" alarm (>=90% usage)
+COLOR_OVERAGE = (0.827, 0.184, 0.184)  # #D32F2F - deeper red for pace overage
 COLOR_BG = (0.25, 0.25, 0.25)      # dark gray track
 COLOR_TEXT = (1.0, 1.0, 1.0)       # white text
 
@@ -187,7 +188,7 @@ def render_icon(session_pct, expected_pct=None):
         if expected_pct is not None and 0 < expected_pct < session_pct:
             # Ahead of pace: usage colour up to expected, red for the overage
             draw_arc(0, expected_pct, usage_color(session_pct))
-            draw_arc(expected_pct, session_pct, COLOR_RED)
+            draw_arc(expected_pct, session_pct, COLOR_OVERAGE)
         else:
             draw_arc(0, session_pct, usage_color(session_pct))
 
@@ -818,7 +819,7 @@ class UsagePopup(Gtk.Window):
             ctx.paint()
             if expected_pct is not None and 0 < expected_pct < pct:
                 expected_w = w * min(expected_pct, 100) / 100.0
-                ctx.set_source_rgb(*COLOR_RED)
+                ctx.set_source_rgb(*COLOR_OVERAGE)
                 ctx.rectangle(expected_w, 0, fill_w - expected_w, height)
                 ctx.fill()
             return False
