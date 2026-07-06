@@ -6,7 +6,7 @@ Built with Python, GTK3, and Linux Mint's native XApp.StatusIcon for seamless Ci
 
 ## Features
 
-- **Live tray icon** with color-coded arc showing session usage (green/yellow/red)
+- **Live tray icon** with color-coded arc showing session usage (green/yellow/red); when you're burning faster than the window allows, the over-pace portion of the arc turns red
 - **Popup dashboard** (left-click) with detailed stats:
   - Session (5h) and Weekly (7d) usage bars with reset countdowns
   - Per-model usage (Opus, Sonnet)
@@ -14,8 +14,7 @@ Built with Python, GTK3, and Linux Mint's native XApp.StatusIcon for seamless Ci
   - Extra usage (overage) status indicator
   - Claude system status (operational/degraded/outage)
   - Available models list
-- **Desktop notifications** at usage thresholds (every 5% from 75-100%)
-- **Pacing alerts** when burning through limits too fast (+10%, then every +5%), with a 10-minute grace period after session reset to avoid false positives
+- **Desktop notifications** at usage thresholds (75%, 90%, 100%) — deliberately sparse; pacing is shown in the tray icon instead of via alerts
 - **Auto-detects plan changes** (Pro/Max 5x/Max 20x) via live API polling
 - **Zero dependencies to install** - uses only packages already on Linux Mint
 
@@ -59,6 +58,8 @@ The circular icon shows your current 5-hour session usage percentage with a colo
 - **Yellow** (75-89%) - getting high
 - **Red** (90-100%) - nearly at limit
 
+When usage is ahead of the expected pace for this point in the 5-hour window, the arc splits in two: the part up to the expected level keeps its usage color, and everything beyond it is drawn red. The bigger the red segment, the further ahead of pace you are — red always means "slow down".
+
 Left-click opens the popup dashboard. Right-click for Refresh/Quit.
 
 ### Pacing
@@ -79,8 +80,9 @@ This helps you spread usage evenly instead of burning through limits early.
 
 | Type | Triggers at |
 |------|------------|
-| Usage thresholds | 75%, 80%, 85%, 90%, 95%, 100% (once each per reset) |
-| Pacing alerts | +10% ahead of pace, then every +5% (after 10min grace period) |
+| Usage thresholds | 75%, 90%, 100% (once each per reset, session and weekly) |
+
+If a single poll jumps across several thresholds at once, only one notification is sent (for the highest). Pacing is never notified — it's shown live in the tray icon arc instead.
 
 ## Authentication
 
