@@ -594,21 +594,21 @@ class UsagePopup(Gtk.Window):
             content_box.set_margin_start(16)
             content_box.set_margin_end(16)
 
+            session_pace = calc_pacing(usage_data.session_pct, usage_data.session_reset, 5)
             content_box.pack_start(
-                self._make_usage_row("Session (5h)", usage_data.session_pct, usage_data.session_reset),
+                self._make_usage_row("Session (5h)", usage_data.session_pct, usage_data.session_reset,
+                                     expected_pct=session_pace[3] if session_pace else None),
                 False, False, 0
             )
-            # Session pacing
-            session_pace = calc_pacing(usage_data.session_pct, usage_data.session_reset, 5)
             if session_pace:
                 content_box.pack_start(self._make_pace_row(session_pace), False, False, 0)
 
+            weekly_pace = calc_pacing(usage_data.weekly_pct, usage_data.weekly_reset, 168)
             content_box.pack_start(
-                self._make_usage_row("Weekly", usage_data.weekly_pct, usage_data.weekly_reset),
+                self._make_usage_row("Weekly", usage_data.weekly_pct, usage_data.weekly_reset,
+                                     expected_pct=weekly_pace[3] if weekly_pace else None),
                 False, False, 0
             )
-            # Weekly pacing
-            weekly_pace = calc_pacing(usage_data.weekly_pct, usage_data.weekly_reset, 168)
             if weekly_pace:
                 content_box.pack_start(self._make_pace_row(weekly_pace), False, False, 0)
 
@@ -753,7 +753,7 @@ class UsagePopup(Gtk.Window):
         if self.on_refresh:
             self.on_refresh()
 
-    def _make_usage_row(self, label_text, pct, reset_time):
+    def _make_usage_row(self, label_text, pct, reset_time, expected_pct=None):
         """Create a labeled usage bar with percentage and countdown."""
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
 
@@ -776,17 +776,8 @@ class UsagePopup(Gtk.Window):
         top_row.pack_end(pct_label, False, False, 0)
         box.pack_start(top_row, False, False, 0)
 
-        # Progress bar
-        bar = Gtk.ProgressBar()
-        bar.set_fraction(min(pct / 100.0, 1.0))
-        bar.get_style_context().add_class("usage-bar")
-        if pct >= 90:
-            bar.get_style_context().add_class("bar-red")
-        elif pct >= 75:
-            bar.get_style_context().add_class("bar-yellow")
-        else:
-            bar.get_style_context().add_class("bar-green")
-        box.pack_start(bar, False, False, 0)
+        # Progress bar (two-tone: overage beyond expected pace drawn red)
+        box.pack_start(self._make_usage_bar(pct, expected_pct), False, False, 0)
 
         # Reset countdown
         if reset_time:
@@ -796,6 +787,46 @@ class UsagePopup(Gtk.Window):
             box.pack_start(reset_label, False, False, 0)
 
         return box
+
+    def _make_usage_bar(self, pct, expected_pct=None):
+        """Cairo-drawn usage bar matching the tray icon's two-tone scheme.
+
+        The fill up to the expected pace keeps the usage colour; anything
+        beyond it is drawn red, mirroring the tray icon arc.
+        """
+        height = 6
+
+        def rounded_bar(ctx, x, width, w_total):
+            radius = min(height / 2.0, width / 2.0)
+            ctx.new_path()
+            ctx.arc(x + radius, height / 2.0, radius, math.pi / 2, 3 * math.pi / 2)
+            ctx.arc(x + width - radius, height / 2.0, radius, 3 * math.pi / 2, math.pi / 2)
+            ctx.close_path()
+
+        def on_draw(widget, ctx):
+            w = widget.get_allocated_width()
+            # Track
+            ctx.set_source_rgb(0.2, 0.2, 0.2)  # #333, matches popup theme
+            rounded_bar(ctx, 0, w, w)
+            ctx.fill()
+            if pct <= 0:
+                return False
+            fill_w = w * min(pct, 100) / 100.0
+            rounded_bar(ctx, 0, fill_w, w)
+            ctx.clip()
+            ctx.set_source_rgb(*usage_color(pct))
+            ctx.paint()
+            if expected_pct is not None and 0 < expected_pct < pct:
+                expected_w = w * min(expected_pct, 100) / 100.0
+                ctx.set_source_rgb(*COLOR_RED)
+                ctx.rectangle(expected_w, 0, fill_w - expected_w, height)
+                ctx.fill()
+            return False
+
+        bar = Gtk.DrawingArea()
+        bar.set_size_request(-1, height)
+        bar.connect("draw", on_draw)
+        return bar
 
     def _make_pace_row(self, pacing):
         """Create a pacing indicator row from calc_pacing() output."""
@@ -873,19 +904,6 @@ class UsagePopup(Gtk.Window):
         .pct-green { color: #4CAF50; }
         .pct-yellow { color: #FFC107; }
         .pct-red { color: #F44336; }
-
-        .usage-bar {
-            min-height: 6px;
-            border-radius: 3px;
-        }
-        .usage-bar trough {
-            min-height: 6px;
-            border-radius: 3px;
-            background: #333;
-        }
-        .bar-green progress { background: #4CAF50; border-radius: 3px; }
-        .bar-yellow progress { background: #FFC107; border-radius: 3px; }
-        .bar-red progress { background: #F44336; border-radius: 3px; }
 
         .reset-text {
             font-size: 10px;
