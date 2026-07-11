@@ -111,6 +111,39 @@ def normalize_reset_time(iso_timestamp):
         return iso_timestamp
 
 
+def _reset_is_later(a, b):
+    """True if normalized reset time `a` is strictly later than `b`."""
+    try:
+        return datetime.fromisoformat(a) > datetime.fromisoformat(b)
+    except (ValueError, TypeError):
+        return a != b
+
+
+def evaluate_window_notifications(pct, norm_reset, last_reset, notified):
+    """Decide which usage thresholds to announce for one window.
+
+    Mutates `notified` (thresholds already announced this window) and
+    returns (new_last_reset, thresholds_to_announce).
+
+    Tracking is only re-armed when a genuinely new, *later* window begins.
+    Missing data (norm_reset is None) or a non-forward change never re-arms,
+    so a flapping or re-anchoring API response can't refire alerts at 100%.
+    """
+    if norm_reset is None:
+        # Window data momentarily absent — keep prior tracking, say nothing.
+        return last_reset, []
+    if last_reset is None:
+        last_reset = norm_reset
+    elif _reset_is_later(norm_reset, last_reset):
+        notified.clear()
+        last_reset = norm_reset
+    # else: same or earlier window — keep the furthest-forward reset seen.
+    crossed = sorted(t for t in NOTIFY_THRESHOLDS
+                     if pct >= t and t not in notified)
+    notified.update(crossed)
+    return last_reset, crossed
+
+
 def calc_pacing(actual_pct, reset_iso, window_hours):
     """Calculate pacing for a usage window.
 
@@ -1171,39 +1204,30 @@ class ClaudeUsageTracker:
     def _check_notifications(self, usage):
         """Send desktop notifications at usage thresholds."""
         # Normalize reset times to the minute so slight API variations
-        # don't clear the notification tracking sets
+        # don't clear the notification tracking sets. Tracking is only
+        # re-armed on a genuinely new window, so a flapping API response
+        # at 100% can't refire the alerts (see evaluate_window_notifications).
         norm_session = normalize_reset_time(usage.session_reset)
         norm_weekly = normalize_reset_time(usage.weekly_reset)
 
-        if norm_session != self._last_session_reset:
-            self._notified_session.clear()
-            self._last_session_reset = norm_session
-        if norm_weekly != self._last_weekly_reset:
-            self._notified_weekly.clear()
-            self._last_weekly_reset = norm_weekly
+        self._last_session_reset, session_crossed = evaluate_window_notifications(
+            usage.session_pct, norm_session,
+            self._last_session_reset, self._notified_session)
+        self._last_weekly_reset, weekly_crossed = evaluate_window_notifications(
+            usage.weekly_pct, norm_weekly,
+            self._last_weekly_reset, self._notified_weekly)
 
-        self._check_threshold(
-            "Session", "5-hour session", usage.session_pct,
-            usage.session_reset, self._notified_session
-        )
-        self._check_threshold(
-            "Weekly", "7-day weekly", usage.weekly_pct,
-            usage.weekly_reset, self._notified_weekly
-        )
+        if session_crossed:
+            self._announce_threshold(
+                "Session", "5-hour session", usage.session_pct,
+                usage.session_reset, max(session_crossed))
+        if weekly_crossed:
+            self._announce_threshold(
+                "Weekly", "7-day weekly", usage.weekly_pct,
+                usage.weekly_reset, max(weekly_crossed))
 
-    def _check_threshold(self, label, window_desc, pct, reset_iso, notified_set):
-        """Notify once for the highest newly crossed threshold in a window.
-
-        Crossing several thresholds in one poll marks them all as notified
-        but sends a single notification, so a fast-burning session can't
-        fire a burst of stacked alerts.
-        """
-        crossed = [t for t in NOTIFY_THRESHOLDS
-                   if pct >= t and t not in notified_set]
-        if not crossed:
-            return
-        notified_set.update(crossed)
-        highest = max(crossed)
+    def _announce_threshold(self, label, window_desc, pct, reset_iso, highest):
+        """Send a single notification for the highest newly crossed threshold."""
         self._send_notification(
             f"{label} usage at {pct:.0f}%",
             f"{window_desc} usage has reached {highest}%. "
