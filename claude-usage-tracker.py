@@ -36,6 +36,8 @@ ACCOUNT_API_URL = "https://api.anthropic.com/api/oauth/account"
 STATUS_API_URL = "https://status.claude.com/api/v2/status.json"
 POLL_INTERVAL_SECONDS = 180
 STATUSLINE_CACHE_PATH = Path("/tmp/claude-statusline-cache.json")
+# Diagnostic log of every desktop notification this app sends.
+NOTIFY_LOG_PATH = Path.home() / ".claude" / "usage-tracker-notifications.log"
 ICON_SIZE = 24
 APP_ID = "claude-usage-tracker"
 APP_NAME = "Claude Usage Tracker"
@@ -1237,10 +1239,22 @@ class ClaudeUsageTracker:
 
     def _send_notification(self, title, body, icon_name):
         """Send a desktop notification."""
+        # Diagnostic: record every notification this process sends, so a
+        # spam report can be traced to the exact source (see NOTIFY_LOG_PATH).
+        try:
+            with open(NOTIFY_LOG_PATH, "a") as f:
+                f.write(f"{datetime.now().isoformat(timespec='seconds')} "
+                        f"pid={os.getpid()} | {title} | {body}\n")
+        except OSError:
+            pass
         try:
             notif = Notify.Notification.new(title, body, icon_name)
             notif.set_app_name(APP_NAME)
             notif.set_urgency(Notify.Urgency.NORMAL)
+            # Transient: pop up once, but don't accumulate in the notification
+            # tray/applet — otherwise each window's alerts pile up and look
+            # like duplicate spam even though each is sent only once.
+            notif.set_hint("transient", GLib.Variant.new_boolean(True))
             notif.show()
         except Exception as e:
             print(f"[WARN] Notification failed: {e}")
