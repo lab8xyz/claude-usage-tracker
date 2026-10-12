@@ -36,6 +36,8 @@ ACCOUNT_API_URL = "https://api.anthropic.com/api/oauth/account"
 STATUS_API_URL = "https://status.claude.com/api/v2/status.json"
 POLL_INTERVAL_SECONDS = 180
 STATUSLINE_CACHE_PATH = Path("/tmp/claude-statusline-cache.json")
+# Shared todo app sidebar shows these stats; set TODO_USAGE_URL="" to disable.
+TODO_USAGE_URL = os.environ.get("TODO_USAGE_URL", "https://todo.apps.lab8.xyz/api/usage")
 # Diagnostic log of every desktop notification this app sends.
 NOTIFY_LOG_PATH = Path.home() / ".claude" / "usage-tracker-notifications.log"
 ICON_SIZE = 24
@@ -1169,10 +1171,22 @@ class ClaudeUsageTracker:
                 STATUSLINE_CACHE_PATH.write_text(json.dumps(cache_data))
             except OSError:
                 pass
+            self._push_to_todo(raw)
         models = self.client.fetch_models() if self._poll_count % 10 == 1 else self.models
         status_indicator, status_desc = self.client.fetch_status()
         # Schedule UI update on main thread
         GLib.idle_add(self._apply_update, usage, models, status_indicator, status_desc)
+
+    @staticmethod
+    def _push_to_todo(raw):
+        """Send the usage percentages (never credentials) to the todo app sidebar."""
+        if not TODO_USAGE_URL:
+            return
+        payload = {k: raw.get(k) for k in ("five_hour", "seven_day", "limits")}
+        try:
+            requests.post(TODO_USAGE_URL, json=payload, timeout=5)
+        except requests.RequestException:
+            pass  # off-net (todo app is LAN/Tailscale only); try again next poll
 
     def _apply_update(self, usage, models=None, status_indicator=None, status_desc=None):
         """Apply fetched data to UI (must run on main thread)."""
