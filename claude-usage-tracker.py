@@ -40,6 +40,11 @@ STATUSLINE_CACHE_PATH = Path("/tmp/claude-statusline-cache.json")
 TODO_USAGE_URL = os.environ.get("TODO_USAGE_URL", "https://todo.apps.lab8.xyz/api/usage")
 # Diagnostic log of every desktop notification this app sends.
 NOTIFY_LOG_PATH = Path.home() / ".claude" / "usage-tracker-notifications.log"
+# API (Console) account: spend comes from the Admin API cost report, which needs an
+# Admin API key (sk-ant-admin...). Key and the manually entered balance live here,
+# outside the repo, mode 600.
+API_CONFIG_PATH = Path.home() / ".config" / "claude-usage-tracker" / "api.json"
+COST_REPORT_URL = "https://api.anthropic.com/v1/organizations/cost_report"
 ICON_SIZE = 24
 APP_ID = "claude-usage-tracker"
 APP_NAME = "Claude Usage Tracker"
@@ -146,6 +151,109 @@ def evaluate_window_notifications(pct, norm_reset, last_reset, notified):
                      if pct >= t and t not in notified)
     notified.update(crossed)
     return last_reset, crossed
+
+
+def evaluate_scoped_notifications(scoped, state):
+    """Threshold check for model-scoped weekly limits (e.g. Fable).
+
+    `scoped` is UsageData.scoped_weekly: [(label, pct, reset_iso), ...].
+    `state` maps label -> {"last_reset": ..., "notified": set()} and is
+    mutated. Returns [(label, pct, reset_iso, highest_threshold), ...]
+    for labels that newly crossed a threshold this poll, using the same
+    dedup rules as the session/weekly windows.
+    """
+    announce = []
+    for label, pct, reset_iso in scoped:
+        st = state.setdefault(label, {"last_reset": None, "notified": set()})
+        st["last_reset"], crossed = evaluate_window_notifications(
+            pct, normalize_reset_time(reset_iso), st["last_reset"], st["notified"])
+        if crossed:
+            announce.append((label, pct, reset_iso, max(crossed)))
+    return announce
+
+
+def load_api_config(path=API_CONFIG_PATH):
+    """Read the API account config; {} when missing or unreadable."""
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_api_config(path, cfg):
+    """Write the API account config, readable only by the owner."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(path, 0o600)
+
+
+def cost_report_start(now, cfg):
+    """Earliest UTC day we need: start of this month, or the balance day if earlier."""
+    start = now.strftime("%Y-%m-01")
+    set_day = cfg.get("balance_set_day")
+    if set_day and set_day < start:
+        start = set_day
+    return f"{start}T00:00:00Z"
+
+
+def fetch_cost_buckets(get, starting_at):
+    """Collect every daily bucket from starting_at, following pagination.
+
+    `get(params) -> parsed JSON` does the HTTP call, so this stays testable.
+    """
+    buckets, page = [], None
+    for _ in range(20):  # safety cap; a few months is 1-3 pages
+        params = {"starting_at": starting_at, "bucket_width": "1d", "limit": 31}
+        if page:
+            params["page"] = page
+        body = get(params)
+        buckets.extend(body.get("data") or [])
+        page = body.get("next_page")
+        if not body.get("has_more") or not page:
+            break
+    return buckets
+
+
+def daily_spend(buckets):
+    """Map UTC day -> USD spent. Amounts are decimal strings in cents."""
+    days = {}
+    for b in buckets:
+        day = (b.get("starting_at") or "")[:10]
+        if not day:
+            continue
+        cents = 0.0
+        for r in b.get("results") or []:
+            try:
+                cents += float(r.get("amount") or 0)
+            except (TypeError, ValueError):
+                pass
+        days[day] = days.get(day, 0.0) + cents / 100.0
+    return days
+
+
+def summarize_api_spend(days, now, cfg):
+    """Today / this month / estimated remaining balance, all in USD.
+
+    Remaining = entered balance minus spend since it was entered. Spend on the
+    entry day before entry (baseline_usd) is added back, since buckets are daily.
+    """
+    today_key = now.strftime("%Y-%m-%d")
+    month_prefix = now.strftime("%Y-%m-")
+    summary = {
+        "today": days.get(today_key, 0.0),
+        "month": sum(v for k, v in days.items() if k.startswith(month_prefix)),
+        "remaining": None,
+    }
+    balance, set_day = cfg.get("balance_usd"), cfg.get("balance_set_day")
+    if balance is not None and set_day:
+        since = sum(v for k, v in days.items() if k >= set_day)
+        summary["remaining"] = float(balance) - (since - float(cfg.get("baseline_usd") or 0.0))
+    return summary
 
 
 def calc_pacing(actual_pct, reset_iso, window_hours):
@@ -551,6 +659,27 @@ class UsageData:
         return self._get_reset("seven_day_sonnet")
 
     @property
+    def scoped_weekly(self):
+        """Model-scoped weekly limits from `limits`, e.g. the Fable allowance.
+
+        Returns [(label, pct, reset_iso), ...]. These never appear as a
+        top-level seven_day_<model> bucket, only as kind "weekly_scoped".
+        """
+        out = []
+        for lim in self.raw.get("limits") or []:
+            if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+                continue
+            scope = lim.get("scope") or {}
+            model = scope.get("model") or {}
+            label = model.get("display_name") or scope.get("surface") or "Scoped"
+            try:
+                pct = float(lim.get("percent") or 0)
+            except (ValueError, TypeError):
+                pct = 0.0
+            out.append((label, pct, lim.get("resets_at")))
+        return out
+
+    @property
     def extra_usage(self):
         """Return extra_usage dict if enabled, else None."""
         extra = self.raw.get("extra_usage")
@@ -564,7 +693,8 @@ class UsageData:
 class UsagePopup(Gtk.Window):
     """A popup window showing detailed usage statistics."""
 
-    def __init__(self, usage_data, client, on_refresh, models=None, status_indicator=None, status_desc=None):
+    def __init__(self, usage_data, client, on_refresh, models=None, status_indicator=None, status_desc=None,
+                 api_spend=None, on_api_settings=None):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
         self.set_decorated(False)
@@ -661,6 +791,16 @@ class UsagePopup(Gtk.Window):
                     False, False, 0
                 )
 
+            for label, pct, reset in usage_data.scoped_weekly:
+                scoped_pace = calc_pacing(pct, reset, 168)
+                content_box.pack_start(
+                    self._make_usage_row(f"{label} (weekly)", pct, reset,
+                                         expected_pct=scoped_pace[3] if scoped_pace else None),
+                    False, False, 0
+                )
+                if scoped_pace:
+                    content_box.pack_start(self._make_pace_row(scoped_pace), False, False, 0)
+
             main_box.pack_start(content_box, False, False, 0)
 
             # Extra usage on/off indicator (like status bar)
@@ -712,7 +852,11 @@ class UsagePopup(Gtk.Window):
             status_box.pack_start(status_text, True, True, 0)
             main_box.pack_start(status_box, False, False, 0)
 
-        # Available models
+        # API (Console) account spend
+        main_box.pack_start(self._make_api_section(api_spend, on_api_settings), False, False, 0)
+
+        # Available models: hidden until the footer "Models" toggle is pressed
+        models_box = None
         if models:
             models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             models_box.get_style_context().add_class("models-section")
@@ -747,6 +891,9 @@ class UsagePopup(Gtk.Window):
 
                 models_box.pack_start(row, False, False, 0)
 
+            models_box.show_all()
+            models_box.set_no_show_all(True)
+            models_box.hide()
             main_box.pack_start(models_box, False, False, 0)
 
         # Footer
@@ -765,11 +912,64 @@ class UsagePopup(Gtk.Window):
 
         footer_box.pack_start(updated_label, True, True, 0)
         footer_box.pack_end(refresh_btn, False, False, 0)
+        if models_box is not None:
+            models_btn = Gtk.ToggleButton(label="Models")
+            models_btn.get_style_context().add_class("refresh-btn")
+            models_btn.connect("toggled", self._on_models_toggled, models_box)
+            footer_box.pack_end(models_btn, False, False, 0)
         main_box.pack_start(footer_box, False, False, 0)
 
         frame.add(main_box)
         self.add(frame)
         self.show_all()
+
+    def _on_models_toggled(self, button, models_box):
+        """Show or hide the models list, shrinking the window back when hidden."""
+        if button.get_active():
+            models_box.show()
+        else:
+            models_box.hide()
+            self.resize(self.get_allocated_width(), 1)
+
+    def _make_api_section(self, api_spend, on_api_settings):
+        """API (Console) account: today / this month / estimated balance."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        box.get_style_context().add_class("models-section")
+
+        header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        header = Gtk.Label(label="API Account")
+        header.get_style_context().add_class("models-header")
+        header.set_halign(Gtk.Align.START)
+        header_row.pack_start(header, True, True, 0)
+        if on_api_settings:
+            gear = Gtk.Button(label="Set up" if api_spend is None else "Settings")
+            gear.get_style_context().add_class("api-settings-btn")
+            gear.connect("clicked", lambda _b: on_api_settings())
+            header_row.pack_end(gear, False, False, 0)
+        box.pack_start(header_row, False, False, 0)
+
+        def line(text, css="status-text"):
+            lbl = Gtk.Label()
+            lbl.set_markup(text)
+            lbl.get_style_context().add_class(css)
+            lbl.set_halign(Gtk.Align.START)
+            box.pack_start(lbl, False, False, 0)
+
+        if api_spend is None:
+            line("Add an Admin API key to see spend")
+        elif api_spend.get("error"):
+            line(f'<span foreground="#F44336">{GLib.markup_escape_text(api_spend["error"])}</span>')
+        else:
+            line(f'Today <b>${api_spend["today"]:.2f}</b>    '
+                 f'This month <b>${api_spend["month"]:.2f}</b>', "api-figures")
+            remaining = api_spend.get("remaining")
+            if remaining is None:
+                line("Enter your balance in Settings to track what's left")
+            else:
+                colour = "#F44336" if remaining < 5 else "#FFC107" if remaining < 20 else "#4CAF50"
+                line(f'Est. balance <span foreground="{colour}"><b>${remaining:.2f}</b></span>',
+                     "api-figures")
+        return box
 
     def _on_mouse_enter(self, widget, event):
         if self._close_timer_id is not None:
@@ -989,6 +1189,18 @@ class UsagePopup(Gtk.Window):
             color: #888;
             margin-bottom: 2px;
         }
+        .api-figures {
+            font-size: 12px;
+            color: #ddd;
+        }
+        .api-settings-btn {
+            font-size: 10px;
+            padding: 0px 6px;
+            min-height: 0;
+            background: #333;
+            color: #ccc;
+            border: 1px solid #555;
+        }
         .model-name {
             font-size: 11px;
             color: #ccc;
@@ -1043,12 +1255,14 @@ class ClaudeUsageTracker:
         self.usage = UsageData()
         self.popup = None
         self.models = []
+        self.api_spend = None  # None = not configured
         self.status_indicator = "none"
         self.status_desc = "Checking..."
         self._notified_session = set()
         self._notified_weekly = set()
         self._last_session_reset = None
         self._last_weekly_reset = None
+        self._scoped_notify_state = {}  # label -> {last_reset, notified}
         self._poll_count = 0
         self._last_fetch_time = 0
 
@@ -1128,6 +1342,8 @@ class ClaudeUsageTracker:
             models=self.models,
             status_indicator=self.status_indicator,
             status_desc=self.status_desc,
+            api_spend=self.api_spend,
+            on_api_settings=self._open_api_settings,
         )
         self.popup.position_near(self._last_click_x, self._last_click_y, getattr(self, '_panel_position', None))
 
@@ -1174,8 +1390,88 @@ class ClaudeUsageTracker:
             self._push_to_todo(raw)
         models = self.client.fetch_models() if self._poll_count % 10 == 1 else self.models
         status_indicator, status_desc = self.client.fetch_status()
+        api_spend = self._fetch_api_spend()
         # Schedule UI update on main thread
-        GLib.idle_add(self._apply_update, usage, models, status_indicator, status_desc)
+        GLib.idle_add(self._apply_update, usage, models, status_indicator, status_desc, api_spend)
+
+    @staticmethod
+    def _fetch_api_spend():
+        """Spend for the API (Console) account, or None when no admin key is set."""
+        cfg = load_api_config()
+        key = (cfg.get("admin_key") or "").strip()
+        if not key:
+            return None
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+
+        def get(params):
+            resp = requests.get(COST_REPORT_URL, params=params, headers=headers, timeout=20)
+            if resp.status_code in (401, 403):
+                raise PermissionError("Admin key rejected (needs sk-ant-admin...)")
+            resp.raise_for_status()
+            return resp.json()
+
+        now = datetime.now(timezone.utc)
+        try:
+            buckets = fetch_cost_buckets(get, cost_report_start(now, cfg))
+        except PermissionError as e:
+            return {"error": str(e)}
+        except (requests.RequestException, ValueError) as e:
+            print(f"[WARN] API cost report failed: {e}")
+            return {"error": "Couldn't reach the cost report"}
+        return summarize_api_spend(daily_spend(buckets), now, cfg)
+
+    def _open_api_settings(self):
+        """Dialog to enter the Admin API key and current prepaid balance."""
+        if self.popup:
+            self.popup.destroy()
+            self.popup = None
+        cfg = load_api_config()
+        dialog = Gtk.Dialog(title="API account", flags=0)
+        dialog.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.set_keep_above(True)
+        grid = Gtk.Grid(row_spacing=8, column_spacing=10, margin=14)
+
+        key_entry = Gtk.Entry(visibility=False, width_chars=40, activates_default=True)
+        key_entry.set_placeholder_text("sk-ant-admin01-...")
+        key_entry.set_text(cfg.get("admin_key") or "")
+        bal_entry = Gtk.Entry(width_chars=12, activates_default=True)
+        bal_entry.set_placeholder_text("e.g. 25.00")
+        if cfg.get("balance_usd") is not None:
+            bal_entry.set_text(f'{float(cfg["balance_usd"]):.2f}')
+        hint = Gtk.Label(xalign=0)
+        hint.set_markup('<small>Admin key: Console, Settings, Admin keys. '
+                        'Balance: Console, Billing. Re-enter it after a top-up.</small>')
+
+        grid.attach(Gtk.Label(label="Admin API key", xalign=0), 0, 0, 1, 1)
+        grid.attach(key_entry, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Current balance ($)", xalign=0), 0, 1, 1, 1)
+        grid.attach(bal_entry, 1, 1, 1, 1)
+        grid.attach(hint, 0, 2, 2, 1)
+        dialog.get_content_area().add(grid)
+        dialog.show_all()
+
+        if dialog.run() == Gtk.ResponseType.OK:
+            cfg["admin_key"] = key_entry.get_text().strip()
+            bal_text = bal_entry.get_text().strip().lstrip("$").replace(",", "")
+            if not bal_text:
+                for k in ("balance_usd", "balance_set_day", "baseline_usd"):
+                    cfg.pop(k, None)
+            else:
+                try:
+                    new_bal = float(bal_text)
+                except ValueError:
+                    new_bal = None
+                if new_bal is not None and new_bal != cfg.get("balance_usd"):
+                    # Daily buckets: remember what today had already cost so it
+                    # isn't subtracted from a balance that already reflects it.
+                    today_spent = (self.api_spend or {}).get("today") or 0.0
+                    cfg["balance_usd"] = new_bal
+                    cfg["balance_set_day"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    cfg["baseline_usd"] = today_spent
+            save_api_config(API_CONFIG_PATH, cfg)
+            self._trigger_refresh(force=True)
+        dialog.destroy()
 
     @staticmethod
     def _push_to_todo(raw):
@@ -1188,9 +1484,11 @@ class ClaudeUsageTracker:
         except requests.RequestException:
             pass  # off-net / not running; try again next poll
 
-    def _apply_update(self, usage, models=None, status_indicator=None, status_desc=None):
+    def _apply_update(self, usage, models=None, status_indicator=None, status_desc=None,
+                      api_spend=None):
         """Apply fetched data to UI (must run on main thread)."""
         self.usage = usage
+        self.api_spend = api_spend
         if models is not None:
             self.models = models
         if status_indicator is not None:
@@ -1206,8 +1504,9 @@ class ClaudeUsageTracker:
                 status_line = f"\nStatus: {self.status_desc}"
             self.icon.set_tooltip_text(
                 f"Session: {usage.session_pct:.1f}% | "
-                f"Weekly: {usage.weekly_pct:.1f}%\n"
-                f"Session resets: {format_countdown(usage.session_reset)}"
+                f"Weekly: {usage.weekly_pct:.1f}%"
+                + "".join(f" | {lbl}: {p:.1f}%" for lbl, p, _ in usage.scoped_weekly)
+                + f"\nSession resets: {format_countdown(usage.session_reset)}"
                 f"{status_line}"
             )
             self._check_notifications(usage)
@@ -1241,6 +1540,10 @@ class ClaudeUsageTracker:
             self._announce_threshold(
                 "Weekly", "7-day weekly", usage.weekly_pct,
                 usage.weekly_reset, max(weekly_crossed))
+        for label, pct, reset, highest in evaluate_scoped_notifications(
+                usage.scoped_weekly, self._scoped_notify_state):
+            self._announce_threshold(
+                f"{label} weekly", f"7-day {label} weekly", pct, reset, highest)
 
     def _announce_threshold(self, label, window_desc, pct, reset_iso, highest):
         """Send a single notification for the highest newly crossed threshold."""
