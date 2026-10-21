@@ -38,27 +38,6 @@ POLL_INTERVAL_SECONDS = 180
 STATUSLINE_CACHE_PATH = Path("/tmp/claude-statusline-cache.json")
 # Shared todo app sidebar shows these stats; set TODO_USAGE_URL="" to disable.
 TODO_USAGE_URL = os.environ.get("TODO_USAGE_URL", "https://todo.apps.lab8.xyz/api/usage")
-# Paperclip (local Claude work queue) paces its dispatcher on these numbers; its token is read
-# from Paperclip's own env file. Set PAPERCLIP_USAGE_URL="" to disable.
-PAPERCLIP_USAGE_URL = os.environ.get("PAPERCLIP_USAGE_URL", "http://127.0.0.1:7900/api/usage")
-PAPERCLIP_ENV_FILE = os.path.expanduser("~/.config/paperclip/paperclip.env")
-
-
-def usage_targets(todo_url, paperclip_url, paperclip_env_file):
-    """[(url, headers)] to send the usage percentages to."""
-    targets = [(todo_url, {})] if todo_url else []
-    if paperclip_url:
-        token = None
-        try:
-            with open(paperclip_env_file) as f:
-                for line in f:
-                    if line.startswith("PAPERCLIP_TOKEN="):
-                        token = line.split("=", 1)[1].strip()
-        except OSError:
-            pass
-        if token:
-            targets.append((paperclip_url, {"Authorization": f"Bearer {token}"}))
-    return targets
 # Diagnostic log of every desktop notification this app sends.
 NOTIFY_LOG_PATH = Path.home() / ".claude" / "usage-tracker-notifications.log"
 ICON_SIZE = 24
@@ -1200,13 +1179,14 @@ class ClaudeUsageTracker:
 
     @staticmethod
     def _push_to_todo(raw):
-        """Send the usage percentages (never Claude credentials) to the todo app and Paperclip."""
+        """Send the usage percentages (never Claude credentials) to the todo app."""
+        if not TODO_USAGE_URL:
+            return
         payload = {k: raw.get(k) for k in ("five_hour", "seven_day", "limits")}
-        for url, headers in usage_targets(TODO_USAGE_URL, PAPERCLIP_USAGE_URL, PAPERCLIP_ENV_FILE):
-            try:
-                requests.post(url, json=payload, headers=headers, timeout=5)
-            except requests.RequestException:
-                pass  # off-net / not running; try again next poll
+        try:
+            requests.post(TODO_USAGE_URL, json=payload, timeout=5)
+        except requests.RequestException:
+            pass  # off-net / not running; try again next poll
 
     def _apply_update(self, usage, models=None, status_indicator=None, status_desc=None):
         """Apply fetched data to UI (must run on main thread)."""
