@@ -85,19 +85,6 @@ def calc_pacing(actual_pct, reset_iso, window_hours):
         return None
 
 
-def pace_indicator(pace_diff):
-    """Return a colored pace arrow/indicator."""
-    if pace_diff > 15:
-        return f"{RED}{BOLD}++{RESET}"
-    if pace_diff > 10:
-        return f"{RED}+{RESET}"
-    if pace_diff > 5:
-        return f"{YELLOW}+{RESET}"
-    if pace_diff < -5:
-        return f"{GREEN}-{RESET}"
-    return f"{GREEN}={RESET}"
-
-
 def get_git_branch():
     """Get the current git branch name."""
     try:
@@ -175,10 +162,21 @@ def get_scoped(data, name):
 
 
 def pace_text(pacing):
-    """' 6% ahead' in red when ahead of even weekly pace by more than 1%."""
-    if pacing and pacing[4] > 1:
-        return f" {RED}{pacing[4]:.0f}% ahead{RESET}"
-    return ""
+    """' 6% over' / ' 3% under' / ' on pace' after a bar, coloured by how far ahead."""
+    if not pacing:
+        return ""
+    diff = pacing[4]
+    if diff > 10:
+        color = RED
+    elif diff > 5:
+        color = YELLOW
+    else:
+        color = GREEN
+    if diff >= 1:
+        return f" {color}{diff:.0f}% over{RESET}"
+    if diff <= -1:
+        return f" {color}{-diff:.0f}% under{RESET}"
+    return f" {color}on pace{RESET}"
 
 
 def format_reset_day(iso_timestamp):
@@ -254,9 +252,6 @@ def main():
     session_pace = calc_pacing(session_pct, session_reset, 5)
     weekly_pace = calc_pacing(weekly_pct, weekly_reset, 168)
     fable_pace = calc_pacing(fable[0], fable[1], 168) if fable else None
-    session_pace_ind = pace_indicator(session_pace[4]) if session_pace else ""
-    weekly_pace_ind = pace_indicator(weekly_pace[4]) if weekly_pace else ""
-    fable_pace_ind = pace_indicator(fable_pace[4]) if fable_pace else ""
 
     # Status indicator
     status = usage.get("_status", "unknown")
@@ -274,14 +269,13 @@ def main():
     branch_part = f" | \u2387  {CYAN}{branch}{RESET}" if branch else ""
     cwd_part = f" | {MAGENTA}{cwd_name}{RESET}" if cwd_name else ""
 
-    # Line 1: Progress bars (pace marker after each %: ++/+ ahead, = on, - under)
+    # Line 1: Progress bars, each followed by how far over/under even pace
     bar_parts = []
     if has_session:
-        bar_parts.append(f"5h: {session_pct:.0f}%{session_pace_ind} {make_bar(session_pct, 10)}")
-    bar_parts.append(f"7d: {weekly_pct:.0f}%{weekly_pace_ind} {make_bar(weekly_pct, 10)}"
-                     f"{pace_text(weekly_pace)}")
+        bar_parts.append(f"5h: {session_pct:.0f}% {make_bar(session_pct, 10)}{pace_text(session_pace)}")
+    bar_parts.append(f"7d: {weekly_pct:.0f}% {make_bar(weekly_pct, 10)}{pace_text(weekly_pace)}")
     if fable:
-        bar_parts.append(f"Fable: {fable[0]:.0f}%{fable_pace_ind} {make_bar(fable[0], 8)}")
+        bar_parts.append(f"Fable: {fable[0]:.0f}% {make_bar(fable[0], 8)}{pace_text(fable_pace)}")
     bar_parts.append(f"ctx: {ctx_pct}% {make_bar(ctx_pct, 8)}")
     print(" " + " | ".join(bar_parts))
 
