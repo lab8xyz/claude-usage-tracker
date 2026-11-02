@@ -43,6 +43,9 @@ NOTIFY_LOG_PATH = Path.home() / ".claude" / "usage-tracker-notifications.log"
 # API (Console) account: spend comes from the Admin API cost report, which needs an
 # Admin API key (sk-ant-admin...). Key and the manually entered balance live here,
 # outside the repo, mode 600.
+# Watcher for usage API fields that start carrying data (e.g. a "limits
+# reset" grant whose field name we don't know yet). See detect_new_fields.
+FIELD_WATCH_PATH = Path.home() / ".config" / "claude-usage-tracker" / "field-watch.json"
 API_CONFIG_PATH = Path.home() / ".config" / "claude-usage-tracker" / "api.json"
 COST_REPORT_URL = "https://api.anthropic.com/v1/organizations/cost_report"
 ICON_SIZE = 24
@@ -170,6 +173,46 @@ def evaluate_scoped_notifications(scoped, state):
         if crossed:
             announce.append((label, pct, reset_iso, max(crossed)))
     return announce
+
+
+def detect_new_fields(raw, state):
+    """Find top-level usage fields carrying data for the first time.
+
+    state: {"baseline": [keys non-null when watching began],
+            "discovered": {key: first_seen_iso}}
+    On the first call (no baseline) the currently non-null keys become the
+    baseline and nothing is reported. After that, any key that's non-null
+    and not in baseline/discovered is returned and added to discovered.
+    Returns (new_state, [newly discovered keys]).
+    """
+    active = sorted(k for k, v in raw.items()
+                    if not k.startswith("_") and v not in (None, [], {}))
+    if "baseline" not in state:
+        return {"baseline": active, "discovered": {}}, []
+    known = set(state["baseline"]) | set(state.get("discovered", {}))
+    newly = [k for k in active if k not in known]
+    if not newly:
+        return state, []
+    now = datetime.now().isoformat(timespec="seconds")
+    discovered = dict(state.get("discovered", {}))
+    for k in newly:
+        discovered[k] = now
+    return dict(state, discovered=discovered), newly
+
+
+def load_field_watch(path=FIELD_WATCH_PATH):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_field_watch(state, path=FIELD_WATCH_PATH):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2))
+    except OSError as e:
+        print(f"[WARN] Couldn't save field watch state: {e}")
 
 
 def load_api_config(path=API_CONFIG_PATH):
@@ -621,6 +664,7 @@ class UsageData:
 
     def __init__(self, raw=None):
         self.raw = raw or {}
+        self.new_fields = {}  # set by the field watcher
         self.error = raw.get("error") if raw else "No data"
         self.last_updated = datetime.now()
 
@@ -833,6 +877,20 @@ class UsagePopup(Gtk.Window):
                 )
                 if scoped_pace:
                     content_box.pack_start(self._make_pace_row(scoped_pace), False, False, 0)
+
+            for key, value in getattr(usage_data, "new_fields", {}).items():
+                preview = json.dumps(value)
+                if len(preview) > 120:
+                    preview = preview[:117] + "..."
+                new_label = Gtk.Label()
+                new_label.set_markup(
+                    f'<span foreground="#FFC107">● New usage field:</span> '
+                    f'<b>{GLib.markup_escape_text(key)}</b>\n'
+                    f'<small>{GLib.markup_escape_text(preview)}</small>')
+                new_label.set_halign(Gtk.Align.START)
+                new_label.set_line_wrap(True)
+                new_label.set_max_width_chars(48)
+                content_box.pack_start(new_label, False, False, 0)
 
             main_box.pack_start(content_box, False, False, 0)
 
@@ -1421,11 +1479,25 @@ class ClaudeUsageTracker:
             except OSError:
                 pass
             self._push_to_todo(raw)
+            self._watch_fields(raw, usage)
         models = self.client.fetch_models() if self._poll_count % 10 == 1 else self.models
         status_indicator, status_desc = self.client.fetch_status()
         api_spend = self._fetch_api_spend()
         # Schedule UI update on main thread
         GLib.idle_add(self._apply_update, usage, models, status_indicator, status_desc, api_spend)
+
+    def _watch_fields(self, raw, usage):
+        """Log usage fields that start carrying data, and flag them for the popup."""
+        state, newly = detect_new_fields(raw, load_field_watch())
+        if newly:
+            save_field_watch(state)
+            for k in newly:
+                print(f"[FIELD] {datetime.now().isoformat(timespec='seconds')} "
+                      f"new usage field '{k}': {json.dumps(raw.get(k))}", flush=True)
+        elif "baseline" in state and not FIELD_WATCH_PATH.exists():
+            save_field_watch(state)
+        usage.new_fields = {k: raw.get(k) for k in state.get("discovered", {})
+                            if raw.get(k) not in (None, [], {})}
 
     @staticmethod
     def _fetch_api_spend():
