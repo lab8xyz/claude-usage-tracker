@@ -1436,7 +1436,23 @@ class ClaudeUsageTracker:
             api_spend=self.api_spend,
             on_api_settings=self._open_api_settings,
         )
-        self.popup.position_near(self._last_click_x, self._last_click_y, getattr(self, '_panel_position', None))
+        x, y = self._last_click_x, self._last_click_y
+        if (x, y) == (0, 0):
+            # The first activate after startup can arrive before any
+            # button-press-event, leaving no click position and putting the
+            # popup in the top-left corner. Use the pointer instead; it's
+            # over the tray icon at this point.
+            x, y = self._pointer_position()
+        self.popup.position_near(x, y, getattr(self, '_panel_position', None))
+
+    @staticmethod
+    def _pointer_position():
+        try:
+            pointer = Gdk.Display.get_default().get_default_seat().get_pointer()
+            _screen, px, py = pointer.get_position()
+            return px, py
+        except Exception:
+            return 0, 0
 
     def _trigger_refresh(self, force=False):
         """Trigger an immediate refresh in a background thread."""
