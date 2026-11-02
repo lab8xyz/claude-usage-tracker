@@ -160,6 +160,37 @@ def get_reset(data, key):
     return entry.get("resets_at")
 
 
+def get_scoped(data, name):
+    """(pct, reset_iso) for a model-scoped weekly limit (e.g. Fable), or None."""
+    for lim in data.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        model = (lim.get("scope") or {}).get("model") or {}
+        if (model.get("display_name") or "").lower() == name:
+            try:
+                return float(lim.get("percent") or 0), lim.get("resets_at")
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def pace_text(pacing):
+    """' 6% ahead' in red when ahead of even weekly pace by more than 1%."""
+    if pacing and pacing[4] > 1:
+        return f" {RED}{pacing[4]:.0f}% ahead{RESET}"
+    return ""
+
+
+def format_reset_day(iso_timestamp):
+    """Format reset time as local 'Mon 16:00'."""
+    if not iso_timestamp:
+        return ""
+    try:
+        return datetime.fromisoformat(iso_timestamp).astimezone().strftime("%a %H:%M")
+    except (ValueError, TypeError):
+        return ""
+
+
 def make_bar(pct, width=10):
     """Create a text-based progress bar."""
     filled = int(pct / 100 * width)
@@ -211,17 +242,21 @@ def main():
         print(f" {BOLD}Claude Usage{RESET}{branch_part} | £{total_cost:.2f} | ctx {ctx_pct}% | {DIM}{usage['_error']}{RESET}")
         return
 
-    # Parse usage
+    # Parse usage. five_hour is null on plans without a session limit.
+    has_session = bool(usage.get("five_hour"))
     session_pct = get_utilization(usage, "five_hour")
     session_reset = get_reset(usage, "five_hour")
     weekly_pct = get_utilization(usage, "seven_day")
     weekly_reset = get_reset(usage, "seven_day")
+    fable = get_scoped(usage, "fable")
 
     # Pacing
     session_pace = calc_pacing(session_pct, session_reset, 5)
     weekly_pace = calc_pacing(weekly_pct, weekly_reset, 168)
+    fable_pace = calc_pacing(fable[0], fable[1], 168) if fable else None
     session_pace_ind = pace_indicator(session_pace[4]) if session_pace else ""
     weekly_pace_ind = pace_indicator(weekly_pace[4]) if weekly_pace else ""
+    fable_pace_ind = pace_indicator(fable_pace[4]) if fable_pace else ""
 
     # Status indicator
     status = usage.get("_status", "unknown")
@@ -239,19 +274,24 @@ def main():
     branch_part = f" | \u2387  {CYAN}{branch}{RESET}" if branch else ""
     cwd_part = f" | {MAGENTA}{cwd_name}{RESET}" if cwd_name else ""
 
-    # Line 1: Progress bars
-    bar_parts = [
-        f" 5h: {session_pct:.0f}% {make_bar(session_pct, 10)}",
-        f"7d: {weekly_pct:.0f}% {make_bar(weekly_pct, 10)}",
-        f"ctx: {ctx_pct}% {make_bar(ctx_pct, 8)}",
-    ]
-    print(" | ".join(bar_parts))
+    # Line 1: Progress bars (pace marker after each %: ++/+ ahead, = on, - under)
+    bar_parts = []
+    if has_session:
+        bar_parts.append(f"5h: {session_pct:.0f}%{session_pace_ind} {make_bar(session_pct, 10)}")
+    bar_parts.append(f"7d: {weekly_pct:.0f}%{weekly_pace_ind} {make_bar(weekly_pct, 10)}"
+                     f"{pace_text(weekly_pace)}")
+    if fable:
+        bar_parts.append(f"Fable: {fable[0]:.0f}%{fable_pace_ind} {make_bar(fable[0], 8)}")
+    bar_parts.append(f"ctx: {ctx_pct}% {make_bar(ctx_pct, 8)}")
+    print(" " + " | ".join(bar_parts))
 
     # Line 2: Info
+    reset_part = (f"→ 5h reset: {format_reset_time(session_reset)}" if has_session
+                  else f"→ 7d reset: {format_reset_day(weekly_reset)}")
     info_parts = [
         f" {status_dot} {BOLD}Claude Usage{RESET}{branch_part}{cwd_part}",
         f"{model_name} £{total_cost:.2f}",
-        f"→ Reset: {format_reset_time(session_reset)}",
+        reset_part,
     ]
     print(" | ".join(info_parts))
 

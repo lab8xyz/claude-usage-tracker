@@ -76,6 +76,27 @@ def test_scoped_notifications_track_labels_independently():
     assert [o[0] for o in out] == ["Fable"], out
 
 
+def test_fable_property_and_missing_session():
+    data = cut.UsageData(SAMPLE)
+    assert data.fable == (94.0, FABLE_RESET)
+    assert data.has_session
+    no_session = cut.UsageData(dict(SAMPLE, five_hour=None, limits=[]))
+    assert not no_session.has_session
+    assert no_session.fable is None
+
+
+def test_pace_phrase():
+    assert cut.pace_phrase(None) == ""
+    assert cut.pace_phrase((1, 7, "d", 30.0, 15.4)) == " (15% ahead of pace)"
+    assert cut.pace_phrase((1, 7, "d", 30.0, -20.0)) == " (20% under pace)"
+    assert cut.pace_phrase((1, 7, "d", 30.0, 0.5)) == " (on pace)"
+
+
+def test_render_icon_two_rings():
+    pb = cut.render_icon(45, 30, 60, 30)
+    assert pb.get_width() == cut.ICON_SIZE
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

@@ -295,52 +295,70 @@ def calc_pacing(actual_pct, reset_iso, window_hours):
         return None
 
 
+def pace_phrase(pacing):
+    """' (8% ahead of pace)' style suffix from a calc_pacing tuple."""
+    if not pacing:
+        return ""
+    diff = pacing[4]
+    if diff > 1:
+        return f" ({diff:.0f}% ahead of pace)"
+    if diff < -1:
+        return f" ({-diff:.0f}% under pace)"
+    return " (on pace)"
+
+
 # --- Icon Rendering ---
 
-def render_icon(session_pct, expected_pct=None):
-    """Render a tray icon as a GdkPixbuf with an arc showing session usage.
+def render_icon(outer_pct, outer_expected=None, inner_pct=None, inner_expected=None):
+    """Render a tray icon as a GdkPixbuf with concentric usage rings.
 
-    When usage is ahead of the expected pace, the arc beyond expected_pct
-    is drawn in red so the size of the red segment shows the overage.
+    Outer ring: weekly usage. Inner ring (optional): Fable weekly usage.
+    When a ring's usage is ahead of its expected pace, the part beyond the
+    expected % is drawn red, so the red segment shows how far ahead you are.
     """
     size = ICON_SIZE
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
     ctx = cairo.Context(surface)
-
     center = size / 2.0
-    radius = (size / 2.0) - 1.5
-    line_width = 3.0
+    start_angle = -math.pi / 2
 
-    # Background track (full circle)
-    ctx.set_line_width(line_width)
-    ctx.set_source_rgb(*COLOR_BG)
-    ctx.arc(center, center, radius, 0, 2 * math.pi)
-    ctx.stroke()
+    def draw_ring(radius, width, pct, expected):
+        ctx.set_line_width(width)
+        ctx.set_line_cap(cairo.LINE_CAP_BUTT)
+        ctx.set_source_rgb(*COLOR_BG)
+        ctx.arc(center, center, radius, 0, 2 * math.pi)
+        ctx.stroke()
+        if pct <= 0:
+            return
 
-    # Usage arc (clockwise from top)
-    if session_pct > 0:
-        start_angle = -math.pi / 2
-
-        def draw_arc(from_pct, to_pct, color):
+        def arc(from_pct, to_pct, color):
             ctx.set_source_rgb(*color)
-            ctx.set_line_width(line_width)
+            ctx.set_line_width(width)
             ctx.set_line_cap(cairo.LINE_CAP_ROUND)
             a0 = start_angle + (2 * math.pi * min(from_pct, 100) / 100)
             a1 = start_angle + (2 * math.pi * min(to_pct, 100) / 100)
             ctx.arc(center, center, radius, a0, a1)
             ctx.stroke()
 
-        if expected_pct is not None and 0 < expected_pct < session_pct:
-            # Ahead of pace: usage colour up to expected, red for the overage
-            draw_arc(0, expected_pct, usage_color(session_pct))
-            draw_arc(expected_pct, session_pct, COLOR_OVERAGE)
+        if expected is not None and 0 < expected < pct:
+            arc(0, expected, usage_color(pct))
+            arc(expected, pct, COLOR_OVERAGE)
+        elif expected is not None and expected <= 0 < pct:
+            arc(0, pct, COLOR_OVERAGE)
         else:
-            draw_arc(0, session_pct, usage_color(session_pct))
+            arc(0, pct, usage_color(pct))
 
-    # Center text (percentage number)
+    if inner_pct is None:
+        draw_ring((size / 2.0) - 1.5, 3.0, outer_pct, outer_expected)
+        font_size = 8.0 if outer_pct < 100 else 6.5
+    else:
+        draw_ring((size / 2.0) - 1.25, 2.5, outer_pct, outer_expected)
+        draw_ring(6.75, 2.0, inner_pct, inner_expected)
+        font_size = 7.0 if outer_pct < 100 else 5.0
+
+    # Center text (outer ring percentage)
     ctx.set_source_rgb(*COLOR_TEXT)
-    pct_text = str(int(session_pct))
-    font_size = 8.0 if session_pct < 100 else 6.5
+    pct_text = str(int(outer_pct))
     ctx.set_font_size(font_size)
     ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
     extents = ctx.text_extents(pct_text)
@@ -680,6 +698,19 @@ class UsageData:
         return out
 
     @property
+    def has_session(self):
+        """The API stopped sending five_hour for some plans; it's null then."""
+        return bool(self.raw.get("five_hour"))
+
+    @property
+    def fable(self):
+        """(pct, reset_iso) for the Fable weekly limit, or None."""
+        for label, pct, reset in self.scoped_weekly:
+            if label.lower() == "fable":
+                return pct, reset
+        return None
+
+    @property
     def extra_usage(self):
         """Return extra_usage dict if enabled, else None."""
         extra = self.raw.get("extra_usage")
@@ -762,12 +793,14 @@ class UsagePopup(Gtk.Window):
             content_box.set_margin_start(16)
             content_box.set_margin_end(16)
 
-            session_pace = calc_pacing(usage_data.session_pct, usage_data.session_reset, 5)
-            content_box.pack_start(
-                self._make_usage_row("Session (5h)", usage_data.session_pct, usage_data.session_reset,
-                                     expected_pct=session_pace[3] if session_pace else None),
-                False, False, 0
-            )
+            session_pace = None
+            if usage_data.has_session:
+                session_pace = calc_pacing(usage_data.session_pct, usage_data.session_reset, 5)
+                content_box.pack_start(
+                    self._make_usage_row("Session (5h)", usage_data.session_pct, usage_data.session_reset,
+                                         expected_pct=session_pace[3] if session_pace else None),
+                    False, False, 0
+                )
             if session_pace:
                 content_box.pack_start(self._make_pace_row(session_pace), False, False, 0)
 
@@ -1307,9 +1340,9 @@ class ClaudeUsageTracker:
         # Periodic polling
         GLib.timeout_add_seconds(POLL_INTERVAL_SECONDS, self._poll)
 
-    def _update_icon(self, session_pct, expected_pct=None):
+    def _update_icon(self, outer_pct, outer_expected=None, inner_pct=None, inner_expected=None):
         """Update the tray icon pixbuf."""
-        pixbuf = render_icon(session_pct, expected_pct)
+        pixbuf = render_icon(outer_pct, outer_expected, inner_pct, inner_expected)
         # Use a rotating filename so XApp detects the change
         if not hasattr(self, '_icon_counter'):
             self._icon_counter = 0
@@ -1496,19 +1529,22 @@ class ClaudeUsageTracker:
             self.status_desc = status_desc
 
         if usage.ok:
-            pacing = calc_pacing(usage.session_pct, usage.session_reset, 5)
-            expected_pct = pacing[3] if pacing else None
-            self._update_icon(usage.session_pct, expected_pct)
-            status_line = ""
+            weekly_pace = calc_pacing(usage.weekly_pct, usage.weekly_reset, 168)
+            fable = usage.fable
+            fable_pace = calc_pacing(fable[0], fable[1], 168) if fable else None
+            self._update_icon(
+                usage.weekly_pct, weekly_pace[3] if weekly_pace else None,
+                fable[0] if fable else None, fable_pace[3] if fable_pace else None)
+            lines = [f"Weekly: {usage.weekly_pct:.0f}%{pace_phrase(weekly_pace)}"]
+            if fable:
+                lines.append(f"Fable: {fable[0]:.0f}%{pace_phrase(fable_pace)}")
+            if usage.has_session:
+                lines.append(f"Session: {usage.session_pct:.0f}% "
+                             f"(resets {format_countdown(usage.session_reset)})")
+            lines.append(f"Weekly resets: {format_countdown(usage.weekly_reset)}")
             if self.status_indicator and self.status_indicator != "none":
-                status_line = f"\nStatus: {self.status_desc}"
-            self.icon.set_tooltip_text(
-                f"Session: {usage.session_pct:.1f}% | "
-                f"Weekly: {usage.weekly_pct:.1f}%"
-                + "".join(f" | {lbl}: {p:.1f}%" for lbl, p, _ in usage.scoped_weekly)
-                + f"\nSession resets: {format_countdown(usage.session_reset)}"
-                f"{status_line}"
-            )
+                lines.append(f"Status: {self.status_desc}")
+            self.icon.set_tooltip_text("\n".join(lines))
             self._check_notifications(usage)
         else:
             self._update_icon(0)
